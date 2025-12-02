@@ -35,7 +35,7 @@ class ApiServiceIntegrationTest {
 
     assertNotNull(response, "API 响应为空");
     if (response.getOutput() != null) {
-      System.out.println("API introduction: " + response.getOutput().getIntroduction());
+      System.out.println("API introduction: " + response);
     } else {
       System.out.println(objectMapper.writeValueAsString(response));
     }
