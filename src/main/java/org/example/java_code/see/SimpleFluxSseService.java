@@ -1,13 +1,16 @@
 package org.example.java_code.see;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
-
-import java.io.IOException;
-import java.time.Duration;
 
 /**
  * SSE服务 - 创建Flux并推送数据给前端
@@ -21,6 +24,11 @@ import java.time.Duration;
 public class SimpleFluxSseService {
 
   private static final ObjectMapper objectMapper = new ObjectMapper();
+
+  /**
+   * 保存可取消的 SSE 流上下文，key 为 streamId。
+   */
+  private final Map<String, CancelableStreamContext> cancelableStreams = new ConcurrentHashMap<>();
 
   /**
    * 创建简单的Flux SSE流
@@ -88,6 +96,124 @@ public class SimpleFluxSseService {
                 log.error("关闭连接失败", e);
               }
             });
+  }
+
+  /**
+   * 创建一个可取消的长时间 SSE 流。
+   *
+   * @param streamId 流标识
+   * @param emitter  SSE 发送器
+   * @throws IOException when stream init fails
+   */
+  public void createCancelableFluxStream(String streamId, SseEmitter emitter) throws IOException {
+    CancelableStreamContext context = new CancelableStreamContext(streamId, emitter);
+    cancelableStreams.put(streamId, context);
+
+    sendCancelableEvent(emitter, streamId, -1, "CONTROL", "control",
+        "流已建立，streamId=" + streamId);
+
+    Disposable disposable = Flux.interval(Duration.ofSeconds(1))
+        .subscribe(sequence -> {
+          try {
+            sendCancelableEvent(emitter, streamId, sequence.intValue(), "RUNNING", "running",
+                "后台持续发送数据 #" + sequence);
+          } catch (IOException e) {
+            log.error("❌ [{}] 可取消流发送失败: {}", streamId, e.getMessage());
+            cancelCancelableStream(streamId, "error", "发送异常，自动终止");
+          }
+        });
+    context.setDisposable(disposable);
+
+    emitter.onCompletion(() -> cleanupCancelableStream(streamId, "complete"));
+    emitter.onTimeout(() -> cancelCancelableStream(streamId, "timeout", "连接超时"));
+    emitter.onError(throwable -> cancelCancelableStream(streamId, "error", "发生错误: " + throwable.getMessage()));
+  }
+
+  /**
+   * 取消并清理可取消流。
+   *
+   * @param streamId 流标识
+   * @param status   状态
+   * @param message  消息
+   * @return 是否找到并取消成功
+   */
+  public boolean cancelCancelableStream(String streamId, String status, String message) {
+    CancelableStreamContext context = cancelableStreams.get(streamId);
+    if (context == null || context.closed.get()) {
+      return false;
+    }
+
+    context.closed.set(true);
+    Disposable disposable = context.disposable;
+    if (disposable != null && !disposable.isDisposed()) {
+      disposable.dispose();
+    }
+
+    try {
+      sendCancelableEvent(context.emitter, streamId, -1, "CANCELLED", status, message);
+    } catch (IOException e) {
+      log.warn("发送取消事件失败: {}", e.getMessage());
+    }
+
+    try {
+      context.emitter.complete();
+    } catch (Exception e) {
+      log.warn("关闭 emitter 失败: {}", e.getMessage());
+    } finally {
+      cancelableStreams.remove(streamId);
+    }
+    return true;
+  }
+
+  /**
+   * 对外暴露的取消接口，默认提示消息。
+   */
+  public boolean cancelCancelableStream(String streamId) {
+    return cancelCancelableStream(streamId, "cancelled", "客户端主动取消");
+  }
+
+  private void cleanupCancelableStream(String streamId, String reason) {
+    CancelableStreamContext context = cancelableStreams.get(streamId);
+    if (context != null && context.closed.compareAndSet(false, true)) {
+      Disposable disposable = context.disposable;
+      if (disposable != null && !disposable.isDisposed()) {
+        disposable.dispose();
+      }
+      cancelableStreams.remove(streamId);
+      log.info("🧹 [{}] 清理可取消流 (原因: {})", streamId, reason);
+    }
+  }
+
+  private void sendCancelableEvent(SseEmitter emitter,
+      String streamId,
+      int number,
+      String label,
+      String status,
+      String message) throws IOException {
+    emitter.send(SseEmitter.event()
+        .name("cancelableEvent")
+        .id(streamId + "-" + System.currentTimeMillis())
+        .data(Map.of(
+            "streamId", streamId,
+            "dataNumber", number,
+            "label", label,
+            "status", status,
+            "message", message,
+            "timestamp", System.currentTimeMillis())));
+  }
+
+  private static class CancelableStreamContext {
+    private final SseEmitter emitter;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private Disposable disposable;
+
+    private CancelableStreamContext(String streamId, SseEmitter emitter) {
+      this.emitter = emitter;
+    }
+
+    private void setDisposable(Disposable disposable) {
+      this.disposable = disposable;
+    }
   }
 
   /**

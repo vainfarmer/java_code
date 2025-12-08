@@ -1,17 +1,19 @@
 package org.example.java_code.see;
 
 import java.io.IOException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
-import org.springframework.web.bind.annotation.CrossOrigin;
-import org.springframework.web.bind.annotation.RequestMethod;
 
 /**
  * 简单的SSE控制器
@@ -171,5 +173,38 @@ public class SimpleFluxSseController {
     });
 
     return emitter;
+  }
+
+  /**
+   * 一直推送数据的 SSE 流（可由前端取消）。
+   */
+  @GetMapping("/cancelable")
+  public SseEmitter cancelableStream(
+      @org.springframework.web.bind.annotation.RequestParam(value = "streamId", required = false) String streamId)
+      throws IOException {
+    if (streamId == null || streamId.isBlank()) {
+      streamId = java.util.UUID.randomUUID().toString();
+    }
+    log.info("📡 [{}] 收到可取消 SSE 请求", streamId);
+    SseEmitter emitter = new SseEmitter(SSE_TIMEOUT);
+    simpleFluxSseService.createCancelableFluxStream(streamId, emitter);
+    return emitter;
+  }
+
+  /**
+   * 前端发送 cancel 信号后，停止对应的 SSE 流。
+   */
+  @PostMapping("/cancel/{streamId}")
+  public ResponseEntity<?> cancelStream(@PathVariable String streamId) {
+    boolean cancelled = simpleFluxSseService.cancelCancelableStream(streamId);
+    if (cancelled) {
+      log.info("🛑 [{}] 客户端请求取消 SSE 流", streamId);
+      return ResponseEntity.ok(java.util.Map.of(
+          "streamId", streamId,
+          "status", "cancelled"));
+    }
+    return ResponseEntity.status(404).body(java.util.Map.of(
+        "streamId", streamId,
+        "status", "not_found"));
   }
 }

@@ -272,6 +272,8 @@
             <button onclick="connectSimple()">📊 简单数据流 (10个数字)</button>
             <button onclick="connectMultiStage()">🔄 多阶段处理 (3个阶段)</button>
             <button onclick="connectHeartbeat()">💓 心跳检测 (10个心跳)</button>
+            <button onclick="connectCancelable()">♾️ 可取消数据流</button>
+            <button id="cancelButton" onclick="cancelCancelableStream()" disabled>✋ 取消当前流</button>
             <button onclick="clearData()">🗑️ 清空数据</button>
         </div>
         
@@ -317,6 +319,8 @@
             success: 0,
             error: 0
         };
+        let currentCancelableStreamId = null;
+        let currentStreamSupportsCancel = false;
         
         /**
          * 连接简单数据流
@@ -324,6 +328,9 @@
          * 响应：10个简单数字，每个间隔500ms
          */
         function connectSimple() {
+            currentStreamSupportsCancel = false;
+            currentCancelableStreamId = null;
+            updateCancelButtonState();
             connect(API_BASE_URL + '/api/sse/simple', '简单数据流');
         }
         
@@ -333,6 +340,9 @@
          * 响应：分三个阶段发送数据
          */
         function connectMultiStage() {
+            currentStreamSupportsCancel = false;
+            currentCancelableStreamId = null;
+            updateCancelButtonState();
             connect(API_BASE_URL + '/api/sse/multi-stage', '多阶段处理流');
         }
         
@@ -342,7 +352,44 @@
          * 响应：每秒发送一个心跳
          */
         function connectHeartbeat() {
+            currentStreamSupportsCancel = false;
+            currentCancelableStreamId = null;
+            updateCancelButtonState();
             connect(API_BASE_URL + '/api/sse/heartbeat', '心跳检测流');
+        }
+
+        /**
+         * 连接可取消的无限流
+         */
+        function connectCancelable() {
+            const streamId = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString());
+            connect(`${API_BASE_URL}/api/sse/cancelable?streamId=${streamId}`, '可取消数据流');
+            currentStreamSupportsCancel = true;
+            currentCancelableStreamId = streamId;
+            updateCancelButtonState();
+            addAnalysisMessage(`🆔 已创建可取消流，ID: ${streamId}`);
+        }
+
+        function cancelCancelableStream() {
+            if (!currentCancelableStreamId) {
+                addAnalysisMessage('⚠️ 当前没有可取消的流');
+                return;
+            }
+
+            fetch(`${API_BASE_URL}/api/sse/cancel/${currentCancelableStreamId}`, {
+                method: 'POST'
+            }).then(res => {
+                if (res.ok) {
+                    addAnalysisMessage(`🛑 已请求取消流 ${currentCancelableStreamId}`);
+                    currentCancelableStreamId = null;
+                    updateCancelButtonState();
+                } else {
+                    addErrorMessage('❌ 取消请求失败');
+                }
+            }).catch(err => {
+                console.error('取消请求出错:', err);
+                addErrorMessage(`❌ 取消请求出错: ${err.message}`);
+            });
         }
         
         /**
@@ -404,6 +451,7 @@
                 eventSource.addEventListener('simpleFluxEvent', handleEvent);
                 eventSource.addEventListener('multiStageEvent', handleEvent);
                 eventSource.addEventListener('heartbeat', handleEvent);
+                eventSource.addEventListener('cancelableEvent', handleEvent);
                 
                 // 默认消息处理
                 eventSource.onmessage = handleEvent;
@@ -460,6 +508,11 @@
                     // 其他消息格式：JSON
                     data = JSON.parse(event.data);
                 }
+
+                if (data.streamId && currentStreamSupportsCancel) {
+                    currentCancelableStreamId = data.streamId;
+                    updateCancelButtonState();
+                }
                 
                 // 添加到UI
                 addRawData(data);
@@ -470,6 +523,19 @@
                 if (data.status && data.status.toLowerCase() === 'completed') {
                     addAnalysisMessage('✅ 数据流完成，主动关闭连接');
                     updateStatus('disconnected', '✅ 流已完成');
+                    if (eventSource) {
+                        eventSource.close();
+                        eventSource = null;
+                        currentCancelableStreamId = null;
+                        updateCancelButtonState();
+                    }
+                }
+
+                if (data.status && data.status.toLowerCase() === 'cancelled') {
+                    addAnalysisMessage('🛑 流已取消');
+                    updateStatus('disconnected', '🛑 流已取消');
+                    currentCancelableStreamId = null;
+                    updateCancelButtonState();
                     if (eventSource) {
                         eventSource.close();
                         eventSource = null;
@@ -590,6 +656,9 @@
                 eventSource.close();
                 eventSource = null;
             }
+            currentCancelableStreamId = null;
+            currentStreamSupportsCancel = false;
+            updateCancelButtonState();
             
             stats = { total: 0, success: 0, error: 0 };
             
@@ -626,6 +695,12 @@
             document.getElementById('totalCount').textContent = stats.total;
             document.getElementById('processCount').textContent = stats.success;
             document.getElementById('errorCount').textContent = stats.error;
+        }
+
+        function updateCancelButtonState() {
+            const cancelBtn = document.getElementById('cancelButton');
+            if (!cancelBtn) return;
+            cancelBtn.disabled = !currentCancelableStreamId;
         }
         
         // 页面卸载时关闭连接
