@@ -28,7 +28,7 @@ public class SimpleFluxSseService {
   /**
    * 保存可取消的 SSE 流上下文，key 为 streamId。
    */
-  private final Map<String, CancelableStreamContext> cancelableStreams = new ConcurrentHashMap<>();
+  private final Map<String, CancelableStreamContext> cancelableStreamsMap = new ConcurrentHashMap<>();
 
   /**
    * 创建简单的Flux SSE流
@@ -107,7 +107,7 @@ public class SimpleFluxSseService {
    */
   public void createCancelableFluxStream(String streamId, SseEmitter emitter) throws IOException {
     CancelableStreamContext context = new CancelableStreamContext(streamId, emitter);
-    cancelableStreams.put(streamId, context);
+    cancelableStreamsMap.put(streamId, context);
 
     sendCancelableEvent(emitter, streamId, -1, "CONTROL", "control",
         "流已建立，streamId=" + streamId);
@@ -138,7 +138,7 @@ public class SimpleFluxSseService {
    * @return 是否找到并取消成功
    */
   public boolean cancelCancelableStream(String streamId, String status, String message) {
-    CancelableStreamContext context = cancelableStreams.get(streamId);
+    CancelableStreamContext context = cancelableStreamsMap.get(streamId);
     if (context == null || context.closed.get()) {
       return false;
     }
@@ -160,7 +160,7 @@ public class SimpleFluxSseService {
     } catch (Exception e) {
       log.warn("关闭 emitter 失败: {}", e.getMessage());
     } finally {
-      cancelableStreams.remove(streamId);
+      cancelableStreamsMap.remove(streamId);
     }
     return true;
   }
@@ -168,18 +168,18 @@ public class SimpleFluxSseService {
   /**
    * 对外暴露的取消接口，默认提示消息。
    */
-  public boolean cancelCancelableStream(String streamId) {
+  public boolean cancelCancelableStreamManual(String streamId) {
     return cancelCancelableStream(streamId, "cancelled", "客户端主动取消");
   }
 
   private void cleanupCancelableStream(String streamId, String reason) {
-    CancelableStreamContext context = cancelableStreams.get(streamId);
+    CancelableStreamContext context = cancelableStreamsMap.get(streamId);
     if (context != null && context.closed.compareAndSet(false, true)) {
       Disposable disposable = context.disposable;
       if (disposable != null && !disposable.isDisposed()) {
         disposable.dispose();
       }
-      cancelableStreams.remove(streamId);
+      cancelableStreamsMap.remove(streamId);
       log.info("🧹 [{}] 清理可取消流 (原因: {})", streamId, reason);
     }
   }

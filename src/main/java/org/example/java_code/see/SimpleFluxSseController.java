@@ -196,7 +196,7 @@ public class SimpleFluxSseController {
    */
   @PostMapping("/cancel/{streamId}")
   public ResponseEntity<?> cancelStream(@PathVariable String streamId) {
-    boolean cancelled = simpleFluxSseService.cancelCancelableStream(streamId);
+    boolean cancelled = simpleFluxSseService.cancelCancelableStreamManual(streamId);
     if (cancelled) {
       log.info("🛑 [{}] 客户端请求取消 SSE 流", streamId);
       return ResponseEntity.ok(java.util.Map.of(
