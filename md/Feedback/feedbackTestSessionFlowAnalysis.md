@@ -3445,4 +3445,3 @@ sse_emitter_error_count (自定义)
 3. **分布式限流**: 使用 Sentinel 或 Resilience4j
 4. **连接池化**: 统一管理所有资源池
 5. **监控告警**: 完善的 Metrics + 告警体系
-
