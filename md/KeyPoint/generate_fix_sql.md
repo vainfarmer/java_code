@@ -5,6 +5,7 @@
 ### 1. Generate SQL 的整体目标
 
 **Generate SQL** 是将自然语言查询转换为结构化 SQL 语句的核心功能。它需要：
+
 - 理解用户意图（What data? When? Which filters?）
 - 识别相关的表和列
 - 构建语义正确的 SQL 查询
@@ -13,6 +14,7 @@
 ### 2. Fix SQL 的目标
 
 **Fix SQL** 用于纠正执行失败或结果不符的 SQL 查询。它包括：
+
 - 错误分析（语法错误 vs 逻辑错误 vs 权限错误）
 - 错误修复
 - 验证修复结果
@@ -61,27 +63,189 @@
 
 ### 2.2 两种生成策略详解
 
-#### **Strategy A: Plan-and-Reflect（计划与反思）**
+项目中使用**并行双路生成策略**，同时执行两种不同的 SQL 生成方法，然后由 LLM 选择最优结果。
 
-**核心思路**：先规划，再执行
+#### **并行执行架构图**
+
+```
+                     ┌─────────────────────────────────────┐
+                     │       preprocess_and_analyze_context │
+                     │   (预处理：状态序列化、方言提取、上下文组装)│
+                     └─────────────────────────────────────┘
+                                      │
+                                      ▼
+                     ┌─────────────────────────────────────┐
+                     │         continue_generate_sql        │
+                     │        (准备开始 SQL 生成)            │
+                     └─────────────────────────────────────┘
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    │                                    │
+                    ▼                                    ▼
+    ┌───────────────────────────┐      ┌───────────────────────────┐
+    │ generate_sql_plan_and_reflect │      │ generate_sql_divide_and_conquer│
+    │        (策略 A)              │      │        (策略 B)              │
+    │                             │      │                             │
+    │  ┌─────────────────────┐   │      │  ┌─────────────────────┐   │
+    │  │ Step 1: Planner     │   │      │  │ Step 1: Divide      │   │
+    │  │   生成详细计划        │   │      │  │   分解为子问题        │   │
+    │  └─────────┬───────────┘   │      │  └─────────┬───────────┘   │
+    │            │               │      │            │               │
+    │            ▼               │      │            ▼               │
+    │  ┌─────────────────────┐   │      │  ┌─────────────────────┐   │
+    │  │ Step 2: SQL         │   │      │  │ Step 2: Conquer     │   │
+    │  │   基于计划生成SQL     │   │      │  │   逐个解答子问题      │   │
+    │  └─────────────────────┘   │      │  └─────────┬───────────┘   │
+    │                             │      │            │               │
+    │                             │      │            ▼               │
+    │                             │      │  ┌─────────────────────┐   │
+    │                             │      │  │ Step 3: Assemble    │   │
+    │                             │      │  │   组装最终 SQL        │   │
+    │                             │      │  └─────────────────────┘   │
+    └───────────────────────────┘      └───────────────────────────┘
+                    │                                    │
+                    └─────────────────┬─────────────────┘
+                                      │
+                                      ▼
+                     ┌─────────────────────────────────────┐
+                     │  choose_better_sql_and_analyze_placeholder │
+                     │   (LLM 选择最优 SQL + Placeholder 检测)     │
+                     └─────────────────────────────────────┘
+```
+
+#### **图的定义代码**（`text2sql_ask_human_graph.py`）
 
 ```python
-# Step 1: 生成详细计划
-planner_output = LLM.invoke(SQL_RESPONSE_GENERATESQL_PLANNER)
-# 返回：表选择、Join 条件、WHERE 子句、GROUP BY、ORDER BY 等详细计划
-
-# Step 2: 基于计划生成 SQL
-sql_output = LLM.invoke(SQL_RESPONSE_GENERATESQL_WITH_EXPLAIN, {
-    "planner": planner_output,
-    ...
-})
-# 返回：SQL 语句 + 业务描述 + 技术说明
+def build_text2sql_ask_human_graph() -> StateGraph:
+    workflow = StateGraph(Text2SQLAskHumanState, ...)
+    
+    # 添加节点
+    workflow.add_node("preprocess_and_analyze_context", preprocess_and_analyze_context)
+    workflow.add_node("generate_sql_plan_and_reflect", generate_sql_plan_and_reflect)
+    workflow.add_node("generate_sql_divide_and_conquer", generate_sql_divide_and_conquer)
+    workflow.add_node("choose_better_sql_and_analyze_placeholder", choose_better_sql_and_analyze_placeholder)
+    workflow.add_node("fix_and_validate_sql", fix_and_validate_sql)
+    workflow.add_node("generate_output", generate_output)
+    
+    # 关键：并行执行两种策略
+    workflow.add_edge("continue_generate_sql", "generate_sql_plan_and_reflect")
+    workflow.add_edge("continue_generate_sql", "generate_sql_divide_and_conquer")
+    
+    # 两种策略都汇聚到选择节点
+    workflow.add_edge("generate_sql_plan_and_reflect", "choose_better_sql_and_analyze_placeholder")
+    workflow.add_edge("generate_sql_divide_and_conquer", "choose_better_sql_and_analyze_placeholder")
+    
+    return workflow.compile()
 ```
+
+---
+
+#### **Strategy A: Plan-and-Reflect（计划与反思）详解**
+
+**核心思路**：先规划，再执行（两步走）
+
+##### **Step 1: 生成详细计划（Planner）**
+
+```python
+# 代码位置：di_brain/text2sql/text2sql_step.py
+def generate_sql_plan_and_reflect(state: Text2SQLAskHumanState):
+    # Step 1: 调用 Planner 生成计划
+    planner = synthesizers["planner"].invoke(state)
+    # ...
+```
+
+**Planner Prompt 核心指令**（`SQL_RESPONSE_GENERATESQL_PLANNER`）：
+
+```
+You are a highly skilled {dialect} SQL planner. Your task is to generate a detailed plan 
+for constructing a syntactically correct {dialect} SQL query.
+
+Follow these guidelines strictly:
+1. 识别上下文中明确提及的相关表和列
+2. 如果上下文包含超过 3 个表，选择不超过 3 个最相关的表
+3. 为每个选中的表指定用途（过滤、连接、聚合）
+4. 如果表包含分区列（partition: true），确保在 WHERE 子句中使用
+5. 如果日期列没有指定时间条件，默认过滤"昨天"（T-1）
+6. 指定表之间的 Join 条件
+7. 定义过滤条件（WHERE 子句）
+8. 指定聚合逻辑（GROUP BY、SUM、COUNT）
+9. 包含排序要求（ORDER BY）
+10. 如果有不确定的值，使用 [PLACEHOLDER] 标记
+```
+
+**Planner 输出示例**：
+```
+1. 选择表：mp_order.dws_order_gmv_1d
+   - 用途：聚合订单金额
+   
+2. 分区列处理：
+   - grass_date 是分区列，必须在 WHERE 中使用
+   - 日期格式参考 sample_data: "2024-12-14"
+   
+3. 过滤条件：
+   - WHERE grass_date = date_add('day', -1, current_date)
+   - WHERE region = 'SG'
+   
+4. 聚合逻辑：
+   - SELECT SUM(gmv) AS total_gmv
+   - GROUP BY region
+   
+5. 排序：
+   - ORDER BY total_gmv DESC
+```
+
+##### **Step 2: 基于计划生成 SQL**
+
+```python
+def generate_sql_plan_and_reflect(state: Text2SQLAskHumanState):
+    planner = synthesizers["planner"].invoke(state)
+    
+    # Step 2: 基于计划生成 SQL
+    llm_output = synthesizers["sql"].invoke({**state, "planner": planner})
+    sql = extract_generated_sql(llm_output)
+    
+    return {
+        "sql_results": [
+            {
+                "method": "plan_and_reflect",
+                "sql": sql,
+                "llm_output": llm_output,
+            }
+        ]
+    }
+```
+
+**SQL 生成 Prompt 核心指令**（`SQL_RESPONSE_GENERATESQL_WITH_EXPLAIN`）：
+
+```
+You are a highly skilled {dialect} SQL expert. Your task is to generate a syntactically 
+correct {dialect} SQL query based on the input question and the provided context.
+
+关键输入：
+- Planner: {planner}  ← 上一步生成的计划
+- Context: {context}  ← 表元数据
+- Sample SQL: {sample_sql}
+- Sample Data: {sample_data}
+
+特殊规则：
+- 使用详细的 Planner 来构建 SQL
+- 如果你认为计划不完全正确，可以反思并按自己的想法生成 SQL（Reflect 能力）
+- 不确定的值使用 [PLACEHOLDER] 标记
+```
+
+**Strategy A 总结**：
+
+| 步骤 | LLM 调用 | 输入 | 输出 |
+|------|---------|------|------|
+| **Planner** | 1 次 | context, sample_sql, sample_data, question | 详细的 SQL 构建计划 |
+| **SQL Generation** | 1 次 | planner + context + question | 最终 SQL + 解释 |
+| **总计** | 2 次 | - | - |
 
 **优点**：
 - 具有明确的思维链（CoT）结构
 - 可以显示 LLM 的推理过程
 - 对复杂查询更稳定
+- **Reflect 能力**：LLM 可以反思计划的正确性并自行调整
 
 **缺点**：
 - 需要两次 LLM 调用
@@ -94,40 +258,188 @@ sql_output = LLM.invoke(SQL_RESPONSE_GENERATESQL_WITH_EXPLAIN, {
 
 ---
 
-#### **Strategy B: Divide-and-Conquer（分而治之）**
+#### **Strategy B: Divide-and-Conquer（分而治之）详解**
 
-**核心思路**：化整为零，逐个解决
+**核心思路**：化整为零，逐个解决（三步走）
+
+##### **Step 1: 分解问题（Divide）**
 
 ```python
-# Step 1: 分解查询
-sub_questions = LLM.invoke(SQL_RESPONSE_DIVIDE_QUESTION)
-# 例：
-# 原始查询："查询每个区域最近 7 天的销售总额"
-# 分解为：
-#   子问题 1："哪些表包含区域信息？"
-#   子问题 2："哪些表包含销售额？"
-#   子问题 3："如何定义最近 7 天？"
-
-# Step 2: 逐个解答子问题
-sub_answers = LLM.invoke(SQL_RESPONSE_CONQUER, {
-    "sub_questions": sub_questions,
-    ...
-})
-# 返回：每个子问题的 SQL 片段
-
-# Step 3: 组装最终 SQL
-final_sql = LLM.invoke(SQL_RESPONSE_SQL_ASSEMBLE, {
-    "sub_questions": sub_questions,
-    "sub_answers": sub_answers,
-    ...
-})
-# 返回：组装后的完整 SQL
+# 代码位置：di_brain/text2sql/text2sql_step.py
+def generate_sql_divide_and_conquer(state: Text2SQLAskHumanState):
+    # Step 1: 分解问题为子问题
+    sub_questions = synthesizers["question_divide"].invoke(state)
+    # ...
 ```
+
+**Divide Prompt 核心指令**（`SQL_RESPONSE_DIVIDE_PROMPT`）：
+
+```
+You are a highly skilled {dialect} SQL decomposition expert. 
+Given the user question and table metadata, break the question into smaller, 
+manageable sub-questions.
+
+输出格式：
+1. Sub-question 1
+   Explanation: 为什么分解出这个子问题
+2. Sub-question 2
+   Explanation: ...
+```
+
+**Divide 输出示例**：
+
+```
+原始问题："查询每个区域最近 7 天的销售总额和订单数量"
+
+分解结果：
+1. Sub-question 1: "哪些表包含区域维度和销售额数据？"
+   Explanation: 需要确定数据来源
+
+2. Sub-question 2: "如何计算最近 7 天的日期范围？"
+   Explanation: 需要确定时间过滤条件的写法
+
+3. Sub-question 3: "如何按区域进行聚合？"
+   Explanation: 需要确定 GROUP BY 的字段
+
+4. Sub-question 4: "订单数量应该用哪个字段计算？"
+   Explanation: COUNT(*) 还是 SUM(order_cnt)
+```
+
+##### **Step 2: 逐个解答子问题（Conquer）**
+
+```python
+def generate_sql_divide_and_conquer(state: Text2SQLAskHumanState):
+    sub_questions = synthesizers["question_divide"].invoke(state)
+    
+    # Step 2: 逐个解答子问题
+    sub_questions_results = synthesizers["question_conquer"].invoke(
+        {
+            **state,
+            "sub_questions": sub_questions,
+        }
+    )
+    # ...
+```
+
+**Conquer Prompt 核心指令**（`SQL_RESPONSE_CONQUER_PROMPT`）：
+
+```
+You are a highly skilled {dialect} SQL expert. Your task is to generate 
+analysis and pseudo SQL for each input question based on the provided context.
+
+输入：
+- Sub-questions: {sub_questions}
+- Context: {context}
+
+输出格式：
+1. Sub-question 1
+   Analysis: 详细分析
+   Pseudo SQL: SELECT ... FROM ... WHERE ...
+
+2. Sub-question 2
+   Analysis: ...
+   Pseudo SQL: ...
+```
+
+**Conquer 输出示例**：
+
+```
+1. Sub-question 1: "哪些表包含区域维度和销售额数据？"
+   Analysis: 根据上下文，mp_order.dws_order_gmv_1d 表包含 region 和 gmv 列
+   Pseudo SQL: 
+     SELECT region, gmv FROM mp_order.dws_order_gmv_1d
+
+2. Sub-question 2: "如何计算最近 7 天的日期范围？"
+   Analysis: grass_date 是分区列，格式为 YYYY-MM-DD
+   Pseudo SQL: 
+     WHERE grass_date >= date_add('day', -7, current_date)
+
+3. Sub-question 3: "如何按区域进行聚合？"
+   Analysis: 使用 GROUP BY region
+   Pseudo SQL: 
+     SELECT region, SUM(gmv) GROUP BY region
+
+4. Sub-question 4: "订单数量应该用哪个字段计算？"
+   Analysis: 表中有 order_cnt 列
+   Pseudo SQL: 
+     SELECT SUM(order_cnt) AS total_orders
+```
+
+##### **Step 3: 组装最终 SQL（Assemble）**
+
+```python
+def generate_sql_divide_and_conquer(state: Text2SQLAskHumanState):
+    sub_questions = synthesizers["question_divide"].invoke(state)
+    sub_questions_results = synthesizers["question_conquer"].invoke({...})
+    
+    # Step 3: 组装最终 SQL
+    llm_output = synthesizers["sql_assemble"].invoke(
+        {
+            **state,
+            "sub_questions": sub_questions,
+            "sub_questions_results": sub_questions_results,
+        }
+    )
+    sql = extract_generated_sql(llm_output)
+    
+    return {
+        "sql_results": [
+            {
+                "method": "divide_conquer",
+                "sql": sql,
+                "llm_output": llm_output,
+            }
+        ]
+    }
+```
+
+**Assemble Prompt 核心指令**（`SQL_RESPONSE_ASSEMBLE_PROMPT`）：
+
+```
+You are a highly skilled {dialect} SQL expert. Your task is to combine 
+the following partial queries from sub-questions results into one final 
+simplified, optimized SQL query that answers the user original question.
+
+输入：
+- Partial SQL Queries: {sub_questions_results}
+- Context: {context}
+
+关键规则：
+1. 只使用上下文中明确提到的列和表
+2. 如果有超过 3 个表，选择最多 3 个最相关的
+3. 分区列必须在 WHERE 子句中使用
+4. 如果日期列没有指定条件，默认过滤"昨天"
+5. 遵循 {dialect} 语法规则
+```
+
+**Assemble 输出示例**：
+
+```sql
+SELECT 
+    region,
+    SUM(gmv) AS total_gmv,
+    SUM(order_cnt) AS total_orders
+FROM mp_order.dws_order_gmv_1d
+WHERE grass_date >= date_add('day', -7, current_date)
+  AND grass_date < current_date
+GROUP BY region
+ORDER BY total_gmv DESC
+```
+
+**Strategy B 总结**：
+
+| 步骤 | LLM 调用 | 输入 | 输出 |
+|------|---------|------|------|
+| **Divide** | 1 次 | context, question | 子问题列表 |
+| **Conquer** | 1 次 | sub_questions, context | 每个子问题的分析 + Pseudo SQL |
+| **Assemble** | 1 次 | sub_questions_results, context | 组装后的最终 SQL |
+| **总计** | 3 次 | - | - |
 
 **优点**：
 - 将复杂问题分解为简单问题
 - 每个子问题更容易准确回答
 - 对多层次查询友好
+- 显式的问题分解过程，便于调试
 
 **缺点**：
 - 三次 LLM 调用（分解 + 回答 + 组装）
@@ -138,6 +450,20 @@ final_sql = LLM.invoke(SQL_RESPONSE_SQL_ASSEMBLE, {
 - 非常复杂的业务逻辑
 - 多层次的聚合和分组
 - 涉及众多表的关联查询
+
+---
+
+#### **两种策略对比表**
+
+| 特性 | Plan-and-Reflect | Divide-and-Conquer |
+|------|------------------|-------------------|
+| **LLM 调用次数** | 2 次 | 3 次 |
+| **Token 消耗** | 中等 | 最多 |
+| **思维模式** | 整体规划 → 执行 | 分解 → 解答 → 组装 |
+| **优势** | 稳定、CoT 清晰 | 复杂问题分解能力强 |
+| **劣势** | 对极复杂问题可能不够 | 分解质量依赖 LLM |
+| **Reflect 能力** | ✅ 有（可反思计划） | ❌ 无 |
+| **调试友好度** | 中 | 高（每步输出可见） |
 
 ---
 
@@ -997,30 +1323,7 @@ def adaptive_strategy_by_complexity(question, tables, state):
 - 低延迟优先 → 并行两种方法
 - 高质量优先 → 4 倍参数尝试 + 人工验证
 
----
 
-## 九、总结与建议
-
-### 9.1 短期优化（1-2 周）
-
-1. **完善 Prompt 示例**：添加更多的 Few-shot 示例
-2. **监控关键指标**：建立监控仪表板
-3. **错误模式分析**：分析失败查询的共同特征
-4. **改进 Choose SQL Prompt**：加入更详细的比较指导
-
-### 9.2 中期优化（1-2 月）
-
-1. **错误分类和针对性修复**：为不同错误类型定制 Fix Prompt
-2. **多维度评分系统**：实现自动化的 SQL 质量评分
-3. **参数学习**：使用历史数据优化 temperature、topP 等参数
-4. **预测执行验证**：在真正执行前验证 SQL 合理性
-
-### 9.3 长期优化（1 季度+）
-
-1. **模型微调**：使用 (问题, SQL) 对微调专用 SQL 生成模型
-2. **多模型融合**：集成不同基础模型的优势
-3. **自学习系统**：从用户反馈和实际执行结果自动改进
-4. **高级推理**：使用更强的推理模型（o3-mini 等）处理复杂查询
 
 ### 9.4 关键代码文件索引
 

@@ -1605,3 +1605,1251 @@ DI-Brain 是一个高度模块化、基于 LangChain 和 LangGraph 构建的复�
 
 总而言之，DI-Brain 是一个设计精良、功能强大、工程实践优秀的对话式数据智能平台。
 
+---
+
+## Token 限制方案详解
+
+项目中对 LLM 输入的 Token 数量有完善的限制方案，以防止超出模型的上下文窗口上限（如 GPT-4o 的 128K token 限制）。
+
+### 多层次的限制机制
+
+项目采用**分层限制策略**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Token 限制架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Layer 1: 组件级别截断 (预处理)                                              │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                │
+│  │ Table Context  │  │  Sample Data   │  │  Result Data   │                │
+│  │  ≤137,000 tok  │  │  ≤3,000 tok    │  │  ≤64KB         │                │
+│  └────────────────┘  └────────────────┘  └────────────────┘                │
+│                                                                              │
+│  Layer 2: 总体 Prompt 限制                                                   │
+│  ┌──────────────────────────────────────────────────────────────┐          │
+│  │  MAX_PROMPT_TOKENS = 150,000                                  │          │
+│  │  = Context (137K) + Sample Data (3K) + Reserved (10K)         │          │
+│  └──────────────────────────────────────────────────────────────┘          │
+│                                                                              │
+│  Layer 3: LLM 输入检查 (运行时)                                             │
+│  ┌──────────────────────────────────────────────────────────────┐          │
+│  │  llm_limiter: max_llm_input_token = 128,000                   │          │
+│  │  超限则抛出 BaseStateError                                    │          │
+│  └──────────────────────────────────────────────────────────────┘          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 核心限制参数
+
+#### Text2SQL Token 限制器
+
+```python
+# di_brain/text2sql/text2sql_token_limiter.py
+
+# Token 管理常量
+MAX_PROMPT_TOKENS = 150000        # 总 Prompt 最大 token 数
+RESERVED_TOKENS = 10000           # 保留给系统提示、用户问题等
+MAX_SAMPLE_DATA_TOKENS = 3000     # 样例数据最大 token
+MAX_CONTEXT_TOKENS = 137000       # 表上下文最大 token (150K - 10K - 3K)
+
+# Token 估算：4 字符 ≈ 1 token
+TOKENS_PER_CHAR = 0.25
+```
+
+#### LLM 输入限制
+
+```python
+# di_brain/config/config.py
+
+DEFAULT_MAX_INPUT_TOKENS = 128000   # 最大输入 token (128K)
+DEFAULT_MAX_OUTPUT_TOKENS = 16384   # 最大输出 token (16K)
+DEFAULT_MAX_LLM_INVOKE_COUNT = 3    # 最大 LLM 调用次数
+```
+
+### 具体截断实现
+
+#### 智能截断函数
+
+```python
+# di_brain/text2sql/text2sql_token_limiter.py
+
+def truncate_context_intelligently(
+    context_data: Any, max_tokens: int = MAX_SAMPLE_DATA_TOKENS
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    简单暴力截断：将输入转换为字符串，超限则截断
+    """
+    # 1. 转换为 JSON 字符串
+    context_str = json.dumps(context_data, ensure_ascii=False, default=str)
+    
+    # 2. 估算 token 数
+    original_tokens = estimate_tokens(context_str)
+    
+    # 3. 如果未超限，直接返回
+    if original_tokens <= max_tokens:
+        return context_str, {"truncated": False, ...}
+    
+    # 4. 超限则截断
+    max_chars = int(max_tokens / TOKENS_PER_CHAR)  # token → 字符数
+    truncated_str = context_str[:max_chars] + "..."
+    
+    return truncated_str, {"truncated": True, ...}
+```
+
+#### Text2SQL 中的应用
+
+```python
+# di_brain/text2sql/text2sql_step.py
+
+def process_context_and_table_samples(state):
+    # 1. 截断样例数据 (≤3000 tokens)
+    table_sample_data = apply_prompt_token_limit(
+        table_sample_data, MAX_SAMPLE_DATA_TOKENS  # 3000
+    )
+    
+    # 2. 截断表上下文 (≤137000 tokens)
+    context_data = apply_prompt_token_limit(
+        context_data, MAX_CONTEXT_TOKENS  # 137000
+    )
+```
+
+#### ChatBI 中的数据截断
+
+```python
+# di_brain/chat_bi/chat_bi_stream_runnable.py
+
+async def result_analyze(self, ...):
+    # 限制传给 LLM 的数据大小
+    MAX_DATA_SIZE_FOR_LLM = 64 * 1024  # 64KB
+    
+    truncated_data = []
+    total_size = 0
+    
+    for row in original_data:
+        row_size = len(str(row).encode("utf-8"))
+        
+        if total_size + row_size > MAX_DATA_SIZE_FOR_LLM:
+            logger.info(f"Truncating result data from {len(original_data)} "
+                       f"rows to {len(truncated_data)} rows")
+            break
+        
+        truncated_data.append(row)
+        total_size += row_size
+```
+
+### LLM 运行时检查
+
+```python
+# di_brain/llms/llm_limiter.py
+
+def llm_limiter(state: T) -> T:
+    # 1. 检查 LLM 调用次数
+    now_invoke_count = sum(1 for msg in state["messages"] if isinstance(msg, AIMessage))
+    if now_invoke_count >= state["max_llm_invoke"]:
+        raise BaseStateError("Exceed max LLM invoke count")
+    
+    # 2. 检查输入 token 数
+    input_tokens = token_estimator(state["messages"])
+    if input_tokens > state["max_llm_input_token"]:  # 默认 128000
+        raise BaseStateError(f"Exceed max input tokens: {state['max_llm_input_token']}")
+    
+    return state
+```
+
+### 各场景的限制总结
+
+| 场景 | 限制类型 | 限制值 | 处理方式 |
+|------|---------|--------|----------|
+| **表上下文 (Context)** | Token | 137,000 | 截断字符串 |
+| **样例数据 (Sample Data)** | Token | 3,000 | 截断字符串 |
+| **样例SQL** | 无明确限制 | - | 每表 TOP 3 条 |
+| **ChatBI 结果数据** | 字节 | 64KB | 按行截断 |
+| **LLM 输入总量** | Token | 128,000 | 运行时检查并抛错 |
+| **LLM 调用次数** | 次数 | 3 | 超限抛错 |
+| **DataMart 上下文** | 字符 | 10,000 | 截断 |
+
+### 限制流程图
+
+```
+用户问题 + RAG 检索结果
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│     Step 1: 组件级截断                   │
+│  ┌─────────────────────────────────┐    │
+│  │ Table Context                    │    │
+│  │ ← truncate_context_intelligently │    │
+│  │   (max: 137,000 tokens)          │    │
+│  └─────────────────────────────────┘    │
+│  ┌─────────────────────────────────┐    │
+│  │ Sample Data                      │    │
+│  │ ← apply_prompt_token_limit       │    │
+│  │   (max: 3,000 tokens)            │    │
+│  └─────────────────────────────────┘    │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│     Step 2: 组装 Prompt                  │
+│  System Prompt + Context + Sample Data  │
+│  + User Question                         │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│     Step 3: 运行时检查                   │
+│  llm_limiter()                          │
+│  ├─ 检查调用次数 ≤ 3                     │
+│  └─ 检查 input_tokens ≤ 128,000         │
+│     超限 → 抛出 BaseStateError           │
+└─────────────────────────────────────────┘
+         │
+         ▼
+      调用 LLM
+```
+
+---
+
+## 关键概念详解
+
+### Sample SQL（样例 SQL）
+
+**Sample SQL** 是从知识库中检索出来的**历史查询 SQL 示例**，用于帮助 LLM 更好地理解如何正确使用表和列。
+
+#### 定义与来源
+
+Sample SQL 存储在 MySQL 数据库的 `mart_top_sql_tab` 表中，记录了每张表被历史用户查询过的最常用 SQL。
+
+```python
+# di_brain/ask_data/database/query.py
+
+def get_table_top_sql_by_name_list(table_names: List[str]) -> dict:
+    """
+    Fetch the top SQL queries for the given table names.
+    
+    Returns:
+        dict: A dictionary of table names and their corresponding SQL content 
+              strings ordered by usage count.
+    """
+    for table_name in table_names:
+        sql = """
+            SELECT sql_content, usage_count
+            FROM mart_top_sql_tab
+            WHERE tbl_name = %s
+            ORDER BY usage_count DESC
+            LIMIT 3  -- 每张表最多返回 3 条最常用的 SQL
+        """
+        cursor.execute(sql, (table_name,))
+        results[table_name] = [row["sql_content"] for row in rows]
+```
+
+#### 数据结构示例
+
+```json
+{
+  "mp_order.dws_order_gmv_1d": [
+    "SELECT grass_date, SUM(gmv) FROM mp_order.dws_order_gmv_1d WHERE grass_date = current_date - interval '1' day GROUP BY grass_date",
+    "SELECT seller_id, SUM(gmv) as total_gmv FROM mp_order.dws_order_gmv_1d GROUP BY seller_id ORDER BY total_gmv DESC LIMIT 10",
+    "SELECT region, COUNT(DISTINCT order_id) FROM mp_order.dws_order_gmv_1d WHERE grass_date BETWEEN date '2024-01-01' AND date '2024-01-31' GROUP BY region"
+  ]
+}
+```
+
+#### 在 Prompt 中的作用
+
+Sample SQL 被注入到 Text2SQL 的 Prompt 中，作为参考示例：
+
+```python
+# di_brain/text2sql/text2sql_prompt.py
+
+"""
+The context provided below contains information retrieved from a knowledge base.
+<context> 
+    {context} 
+    Here are some sample SQLs of tables you may reference: {sample_sql}
+    Here are some sample data of tables you may reference: {sample_data}
+<context/>
+"""
+```
+
+**作用**：
+1. **语法参考**：帮助 LLM 了解正确的 SQL 语法和函数用法
+2. **业务模式**：展示常见的查询模式（如分组、聚合、过滤条件）
+3. **列名映射**：提供真实的列名使用示例，减少 LLM 编造列名的可能性
+
+---
+
+### Sample Data（样例数据）
+
+**Sample Data** 是从 DataMap API 获取的**表数据预览**，包含每个列的真实数据样本，用于帮助 LLM 理解列的实际值和格式。
+
+#### 定义与来源
+
+Sample Data 通过调用 DataMap 的 API 获取：
+
+```python
+# di_brain/tools/datamap_table_sample_tool.py
+
+def get_table_sample_data(
+    table_full_names: Union[str, List[str]],
+    hadoop_account: str,
+) -> Union[str, List[Dict]]:
+    """
+    Fetch sample data for the given list of table full names.
+    
+    Args:
+        table_full_names: A list of table full names (idc_region.schema.table_name)
+    
+    Returns:
+        A list of dictionaries containing table names and their sample data.
+    """
+    # 并行获取多张表的样例数据
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for table in req_tables:
+            future = executor.submit(fetch_table_data, table)
+            # ...
+```
+
+#### 数据结构示例
+
+```json
+[
+  {
+    "table_name": "mp_order.dws_order_gmv_1d",
+    "columns": [
+      {
+        "column_name": "grass_date",
+        "column_type": "STRING",
+        "preview_data": ["2024-12-01", "2024-12-02", "2024-12-03"]
+      },
+      {
+        "column_name": "region",
+        "column_type": "STRING",
+        "preview_data": ["SG", "MY", "TH", "PH"]
+      },
+      {
+        "column_name": "gmv",
+        "column_type": "DOUBLE",
+        "preview_data": [12345.67, 23456.78, 34567.89]
+      },
+      {
+        "column_name": "order_status",
+        "column_type": "INT",
+        "preview_data": [1, 2, 3, 4]
+      }
+    ]
+  }
+]
+```
+
+#### 在 Prompt 中的作用
+
+**作用**：
+1. **分区列值**：帮助 LLM 确定分区列（如 `grass_date`）的正确格式
+2. **枚举值参考**：展示列的可能取值（如 `region` 可能是 "SG", "MY", "TH" 等）
+3. **数据类型确认**：确认列的实际数据类型和格式
+4. **减少占位符**：有了真实数据样本，LLM 可以更准确地填写 WHERE 条件
+
+在 Prompt 中的指导说明：
+
+```python
+"""
+4. If a selected table contains partition columns (columns marked as `partition: true`), 
+   you MUST include all partition columns in the WHERE clause of the query. 
+   If you are not sure about the value of the partition columns, you can use 
+   'preview_data' in the 'sample_data' section or value from 'enumeration' 
+   in the 'metadata' section to help you decide.
+"""
+```
+
+---
+
+### Knowledge Domain / Group（知识域/数据域）
+
+**Knowledge Domain**（或称 **Data Group / DataMart / Topic**）是数据仓库的**逻辑分组**，将相关的表、文档、术语表和规则组织在一起，便于管理和检索。
+
+#### 定义
+
+在 DI-Brain 中，Knowledge Domain 主要有两种形式：
+
+1. **DataMart（数据市场）**：面向特定业务领域的数据集合
+2. **DataTopic（数据主题）**：更细粒度的数据分类
+
+#### 支持的 DataMarts 列表
+
+```python
+# di_brain/knowledge_summary.py
+
+datamart_kb_names = [
+    "Order Mart",           # 订单数据
+    "Item Mart",            # 商品数据
+    "Promotion Mart",       # 促销数据
+    "Seller Mart",          # 卖家数据
+    "Traffic Mart",         # 流量数据
+    "SBS Mart",             # SBS 业务
+    "SPX Mart",             # SPX 物流
+    "User Mart",            # 用户数据
+    "WMS Mart",             # 仓储管理
+    "Voucher Mart",         # 优惠券
+    "Campaign Operation Mart",  # 运营活动
+    "Chatbot Mart",         # 聊天机器人
+    "Paid Ads Mart",        # 付费广告
+    "Mall Mart",            # 商城数据
+    "DI MetaMart",          # 元数据中心
+    # ... 更多 Marts
+]
+```
+
+#### 在系统中的作用
+
+Knowledge Domain 在 RAG 流程中扮演关键角色：
+
+```
+用户问题
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  Data Scope Clarification Agent         │
+│  (识别问题涉及的数据域)                  │
+│                                          │
+│  用户问题: "查询昨天的 GMV"               │
+│  识别结果: Order Mart (high confidence)  │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  RAG 检索范围限定                        │
+│                                          │
+│  仅在 Order Mart 范围内检索：            │
+│  - 相关表 (dws_order_*, dwd_order_*)    │
+│  - 相关文档 (Order Mart User Guide)     │
+│  - 相关术语 (GMV 定义、订单状态码)       │
+│  - 相关规则 (计算逻辑、过滤条件)         │
+└─────────────────────────────────────────┘
+```
+
+#### 数据域的内容组成
+
+每个 Knowledge Domain 包含以下类型的知识：
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| **Tables** | 该域下的 Hive 表 | `mp_order.dws_order_gmv_1d` |
+| **Documents** | 业务文档和用户指南 | `Order Mart User Guide.md` |
+| **Glossaries** | 术语定义 | GMV = Gross Merchandise Value |
+| **Rules** | 计算规则和业务逻辑 | `GMV = price * quantity - discount` |
+| **Sample SQL** | 该域下表的常用 SQL | TOP 3 历史查询 |
+
+#### 在 Prompt 中的使用
+
+Data Scope Clarification Agent 使用的 Prompt：
+
+```python
+# di_brain/data_scope_agent/prompt.py
+
+analysis_prompt = """
+You are a data scope clarification agent. Your task is to analyze the user's 
+query and identify which Data Groups (DataMarts or Topics) are relevant.
+
+Available Data Groups (DataMarts and Topics):
+{scope_context}
+
+User Query: {user_query}
+
+Please analyze the query and determine:
+1. If the user query explicitly mentions a specific Data Group
+2. If no specific mart is mentioned, determine which Data Groups are relevant
+3. How confident you are in the match (high/medium/low)
+4. Whether more information is needed to make a determination
+
+Guidelines:
+- PRIORITY: If the query contains a specific DataMart name (e.g., "User Mart", 
+  "Order Mart"), immediately return that mart as matched data group
+- Use "insufficient_info" if the query is too vague or ambiguous
+- Use "scope_identified" if you can identify 1 or more relevant Domains
+- Use "no_match" if the query doesn't match any available Domains
+"""
+```
+
+#### 知识域的命名约定
+
+在知识库中，不同类型的知识使用不同的前缀：
+
+```python
+# 表的知识库名称
+"prefill_hive_table_SG.mp_order.dws_order_gmv_1d"
+
+# DataMart 的知识库名称
+"prefill_datamart_Order Mart"
+
+# Topic 的知识库名称
+"prefill_topic_SPX First Mile"
+```
+
+这种命名约定使得系统可以清晰地管理和引用不同来源的知识。
+
+---
+
+### 三者在 RAG 流程中的协作
+
+```
+用户问题: "查询昨天 Order Mart 的 GMV 数据"
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Step 1: 识别 Knowledge Domain                               │
+│  → 识别出 "Order Mart"                                       │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Step 2: 检索相关表                                          │
+│  → 从 Order Mart 中找到 mp_order.dws_order_gmv_1d           │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Step 3: 获取 Sample SQL                                     │
+│  → 获取该表的 TOP 3 历史 SQL                                 │
+│  → 提供 SQL 语法和模式参考                                   │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Step 4: 获取 Sample Data                                    │
+│  → 获取列的真实数据样本                                      │
+│  → 确定 grass_date 格式为 "2024-12-14"                      │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Step 5: 组装 Prompt 并生成 SQL                              │
+│  → 结合 Context + Sample SQL + Sample Data                   │
+│  → LLM 生成准确的 SQL 查询                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+这三个概念共同构成了 DI-Brain RAG 系统的核心知识管理体系，确保 LLM 能够获得足够的上下文信息来生成准确的 SQL 查询。
+
+---
+
+## LLM Prompt 数据组装全景图
+
+本节详细说明最终拼接给 LLM 的数据包含哪些内容，以及它们各自的来源。
+
+### 数据来源与流向架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    find_data Tool 返回的原始数据结构                              │
+│                                                                                  │
+│  {                                                                               │
+│    "related_tables": [...],      ← Hive 表元数据                                 │
+│    "related_docs": [...],        ← 业务文档（User Guide 等）                      │
+│    "related_glossaries": [...],  ← 术语表（GMV 定义等）                           │
+│    "related_rules": [...]        ← 计算规则                                       │
+│  }                                                                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼ preprocess_and_analyze_context() 解析
+                    │
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         解析后的 State 变量                                       │
+│                                                                                  │
+│  state["docs"]              ← related_tables → Hive 表详情（TableDetail）         │
+│  state["find_data_docs"]    ← related_docs → 文档内容字符串                       │
+│  state["find_glossary_info"]← related_glossaries → 术语表字符串                   │
+│  state["find_rule_info"]    ← related_rules → 规则描述字符串                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼ process_context_and_table_samples() 处理
+                    │
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         补充获取的数据                                            │
+│                                                                                  │
+│  state["sample_sql"]   ← get_table_top_sql_by_name_list() 从 MySQL 获取           │
+│  state["sample_data"]  ← get_table_sample_data() 从 DataMap API 获取              │
+│  state["context"]      ← docs 经过格式转换和 token 截断                           │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 各数据的详细来源
+
+#### 1. Context（表结构元数据）- Hive 表元数据
+
+**内容**：Hive 表的完整结构信息，包括表名、描述、所有列的信息（名称、类型、描述、是否分区列等）。
+
+**来源**：`find_data_docs["related_tables"]`
+
+**存储位置**：MySQL `knowledge_base_details` 表，`document_type = "datamap_table_detail"`
+
+**数据结构示例**：
+
+```json
+{
+  "idc_region": "SG",
+  "schema": "mp_order", 
+  "table_name": "dws_order_gmv_1d",
+  "table_desc": "Daily GMV aggregation table",
+  "columns": [
+    {"name": "grass_date", "type": "STRING", "desc": "Date partition", "partition": true},
+    {"name": "gmv", "type": "DOUBLE", "desc": "Gross Merchandise Value"},
+    {"name": "region", "type": "STRING", "desc": "Market region code"}
+  ]
+}
+```
+
+**获取路径**：
+
+```
+find_data Tool 
+  → data_discovery_tool 
+  → get_table_details_by_full_table_names() 
+  → kb_client.get_details_by_knowledge_base_names()
+  → MySQL knowledge_base_details 表
+```
+
+---
+
+#### 2. find_data_docs（业务文档）- DataMart User Guide 等
+
+**内容**：与数据域相关的业务文档，通常是 Confluence 文档或用户指南。
+
+**来源**：`find_data_docs["related_docs"]`
+
+**存储位置**：MySQL `knowledge_base_details` 表，`document_type = "datamart_desc_doc"`
+
+**数据结构示例**：
+
+```json
+[
+  {
+    "doc_name": "Order Mart User Guide",
+    "url": "https://confluence.shopee.io/display/order-mart",
+    "content": "Order Mart contains daily GMV data for all marketplace orders..."
+  }
+]
+```
+
+**获取路径**：
+
+```
+find_data Tool 
+  → get_related_doc_by_kb(kb_name_list) 
+  → get_kb_details_by_type(kb_list, "datamart_desc_doc")
+  → MySQL knowledge_base_details 表
+```
+
+---
+
+#### 3. find_glossary_info（术语表）- 业务术语定义
+
+**内容**：业务术语的定义和同义词，帮助 LLM 理解业务概念。
+
+**来源**：`find_data_docs["related_glossaries"]`（由 ask_data_global 返回）
+
+**数据结构示例**：
+
+```json
+[
+  {
+    "glossary_name": "GMV",
+    "synonym": "Gross Merchandise Value",
+    "desc": "Total value of merchandise sold through the marketplace, excluding canceled and refunded orders"
+  },
+  {
+    "glossary_name": "DAU",
+    "synonym": "Daily Active Users",
+    "desc": "Number of unique users who visited the platform in a single day"
+  }
+]
+```
+
+**在 Prompt 中的格式**：
+
+```
+GMV:
+ Gross Merchandise Value
+Total value of merchandise sold through the marketplace, excluding canceled and refunded orders
+
+DAU:
+ Daily Active Users
+Number of unique users who visited the platform in a single day
+```
+
+---
+
+#### 4. find_rule_info（计算规则）- 业务计算逻辑
+
+**内容**：具体的业务计算规则和逻辑，帮助 LLM 正确生成计算表达式。
+
+**来源**：`find_data_docs["related_rules"]`（由 ask_data_global 返回）
+
+**数据结构示例**：
+
+```json
+[
+  {
+    "rule_desc": "GMV = price * quantity - discount, excluding orders with status = 'canceled' or 'refunded'"
+  },
+  {
+    "rule_desc": "Conversion Rate = completed_orders / total_visits * 100"
+  }
+]
+```
+
+---
+
+#### 5. sample_sql（样例 SQL）- 历史常用 SQL
+
+**内容**：该表历史上最常被使用的 SQL 查询示例，按使用次数排序，每表最多返回 TOP 3 条。
+
+**来源**：MySQL `mart_top_sql_tab` 表
+
+**获取函数**：`get_table_top_sql_by_name_list(table_titles)`
+
+**数据结构示例**：
+
+```json
+{
+  "mp_order.dws_order_gmv_1d": [
+    "SELECT grass_date, SUM(gmv) FROM mp_order.dws_order_gmv_1d WHERE grass_date = current_date - interval '1' day GROUP BY grass_date",
+    "SELECT seller_id, SUM(gmv) as total_gmv FROM mp_order.dws_order_gmv_1d GROUP BY seller_id ORDER BY total_gmv DESC LIMIT 10",
+    "SELECT region, COUNT(DISTINCT order_id) FROM mp_order.dws_order_gmv_1d WHERE grass_date BETWEEN date '2024-01-01' AND date '2024-01-31' GROUP BY region"
+  ]
+}
+```
+
+**获取路径**：
+
+```
+process_context_and_table_samples() 
+  → get_table_top_sql_by_name_list(table_titles)
+  → MySQL mart_top_sql_tab 表 
+  → SELECT sql_content FROM mart_top_sql_tab WHERE tbl_name = ? ORDER BY usage_count DESC LIMIT 3
+```
+
+**注意**：Sample SQL 存储在 MySQL 中，不是 Hive 表。
+
+---
+
+#### 6. sample_data（样例数据）- 表数据预览
+
+**内容**：Hive 表每个列的真实数据样本（预览数据）。
+
+**来源**：**DataMap API**（非直接查询 Hive）
+
+**获取函数**：`get_table_sample_data_generate_sql(table_titles, hadoop_account)`
+
+**数据结构示例**：
+
+```json
+[
+  {
+    "table_name": "mp_order.dws_order_gmv_1d",
+    "columns": [
+      {
+        "column_name": "grass_date", 
+        "column_type": "STRING", 
+        "preview_data": ["2024-12-14", "2024-12-13", "2024-12-12"]
+      },
+      {
+        "column_name": "region", 
+        "column_type": "STRING", 
+        "preview_data": ["SG", "MY", "TH", "PH", "VN"]
+      },
+      {
+        "column_name": "gmv", 
+        "column_type": "DOUBLE", 
+        "preview_data": [12345.67, 23456.78, 34567.89]
+      }
+    ]
+  }
+]
+```
+
+**获取路径**：
+
+```
+process_context_and_table_samples() 
+  → get_table_sample_data_generate_sql(table_titles, hadoop_account)
+  → DataMap API (https://open-api.datasuite.shopee.io/datamap/api/v2/...)
+```
+
+**重要说明**：
+- Sample Data 的**内容是 Hive 表的数据**
+- 但获取方式是通过 **DataMap API**，而不是直接执行 Hive 查询
+- DataMap 服务预先缓存了每张表的样例数据，通过 API 返回
+- 好处：速度快、不占用 Hive 计算资源、不需要用户有 Hive 查询权限
+
+---
+
+### 最终 Prompt 结构
+
+根据使用场景（普通模式 vs Compass 模式），Prompt 结构略有不同：
+
+#### 普通模式 Prompt
+
+```python
+"""
+You are a highly skilled {dialect} SQL expert...
+
+Syntax Rules for {dialect}:
+{dialect_syntax}
+
+Planner:
+<planner>
+    {planner}
+</planner>
+
+The context provided below contains information retrieved from a knowledge base.
+<context> 
+    {context}                    # ← Hive 表结构元数据
+    Here are some sample SQLs of tables you may reference: {sample_sql}
+    Here are some sample data of tables you may reference: {sample_data}
+<context/> 
+
+The user background info below contains user's information in company.
+<user_background_info>
+    {user_background_info}       # ← 用户的 region_code, team_code 等
+<user_background_info/>
+"""
+```
+
+#### Compass 模式 Prompt（额外包含文档、术语、规则）
+
+```python
+"""
+You are a highly skilled {dialect} SQL expert...
+
+Input:
+- Table Schema: {context}                    # ← 表结构元数据
+
+- Document Context: {find_data_docs}         # ← 业务文档 (User Guide)
+
+- Glossary Context: {find_glossary_info}     # ← 术语定义
+
+- Rule Context: {find_rule_info}             # ← 计算规则
+    
+- Sample Data: {sample_data}                 # ← 表预览数据
+
+- User Background Info: {user_background_info}  # ← 用户信息
+"""
+```
+
+---
+
+### 数据来源总结表
+
+| 变量名 | 内容描述 | 数据来源 | 实际存储位置 |
+|--------|----------|----------|--------------|
+| **context** | Hive 表结构元数据（表名、列信息、分区等） | find_data → kb_client | MySQL `knowledge_base_details` 表 |
+| **find_data_docs** | 业务文档 (User Guide, FAQ) | find_data → get_related_doc_by_kb | MySQL `knowledge_base_details` 表 |
+| **find_glossary_info** | 术语定义（GMV、DAU 等业务概念） | find_data → ask_data_global | 知识库/向量库检索 |
+| **find_rule_info** | 计算规则（业务计算逻辑） | find_data → ask_data_global | 知识库/向量库检索 |
+| **sample_sql** | 历史常用 SQL（TOP 3） | get_table_top_sql_by_name_list | MySQL `mart_top_sql_tab` 表 |
+| **sample_data** | 表数据预览（列的样例值） | get_table_sample_data | **DataMap API** |
+| **user_background_info** | 用户信息（region、team 等） | chat_context | 请求上下文 |
+| **dialect_syntax** | SQL 方言语法规则 | 配置文件 | 代码中的 Prompt 常量 |
+
+---
+
+### 数据处理流程代码
+
+核心的数据处理流程在 `preprocess_and_analyze_context` 函数中：
+
+```python
+# di_brain/text2sql/text2sql_step.py
+
+def preprocess_and_analyze_context(
+    state: Text2SQLAskHumanState, config: RunnableConfig
+) -> Text2SQLAskHumanState:
+    """Combined node: preprocess_state + process_context + analyze_context"""
+    
+    # 1. 解析 find_data_docs（JSON 字符串）
+    if state.get("find_data_docs") is not None:
+        find_data_docs = json.loads(state["find_data_docs"])
+        
+        # 2. 提取 related_tables → 表结构
+        table_details = find_data_docs.get("related_tables", [])
+        state["docs"] = table_details
+        
+        # 3. 提取 related_docs → 业务文档
+        doc_details = find_data_docs.get("related_docs", [])
+        state["find_data_docs"] = "\n\n".join([
+            doc.get("doc_name", "") + ":\n " + doc.get("content", "")
+            for doc in doc_details
+        ])
+        
+        # 4. 提取 related_glossaries → 术语表
+        glossary_details = find_data_docs.get("related_glossaries", [])
+        state["find_glossary_info"] = "\n\n".join([
+            glossary.get("glossary_name", "") + ":\n " + 
+            glossary.get("synonym", "") + "\n" + 
+            glossary.get("desc", "")
+            for glossary in glossary_details
+        ])
+        
+        # 5. 提取 related_rules → 计算规则
+        rule_details = find_data_docs.get("related_rules", [])
+        state["find_rule_info"] = "\n\n".join([
+            rule.get("rule_desc", "") for rule in rule_details
+        ])
+    
+    # 6. 处理上下文并获取样例数据
+    process_context_and_table_samples(state)
+    
+    return state
+```
+
+样例数据的获取在 `process_context_and_table_samples` 函数中：
+
+```python
+def process_context_and_table_samples(
+    state: Text2SQLAskHumanState,
+) -> Text2SQLAskHumanState:
+    """获取 sample_sql 和 sample_data"""
+    
+    context_data = state["docs"]
+    table_titles = [
+        f"{table.idc_region}.{table.schema}.{table.table_name}"
+        for table in context_data
+    ]
+    
+    # 获取 Sample SQL（从 MySQL）
+    table_sample_sql = get_table_top_sql_by_name_list(table_titles)
+    state["sample_sql"] = table_sample_sql
+    
+    # 获取 Sample Data（从 DataMap API）
+    table_sample_data = get_table_sample_data_generate_sql(
+        table_titles, hadoop_account, LIMIT_PROMPT_TOKEN
+    )
+    # 应用 Token 限制
+    table_sample_data = apply_prompt_token_limit(
+        table_sample_data, MAX_SAMPLE_DATA_TOKENS  # 3000 tokens
+    )
+    state["sample_data"] = table_sample_data
+    
+    # 应用 Context Token 限制
+    context_data = apply_prompt_token_limit(
+        context_data, MAX_CONTEXT_TOKENS  # 137000 tokens
+    )
+    state["context"] = context_data
+    
+    return state
+```
+
+---
+
+### 数据来源关系图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              数据存储层                                           │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐ │
+│  │   MySQL 数据库       │     │   DataMap API       │     │   向量数据库         │ │
+│  │                     │     │                     │     │   (Milvus)          │ │
+│  │ • knowledge_base_   │     │ • 表预览数据        │     │                     │ │
+│  │   details           │     │   /api/v2/preview   │     │ • table_manifest    │ │
+│  │   - 表结构元数据     │     │                     │     │ • table_columns     │ │
+│  │   - 业务文档        │     │                     │     │                     │ │
+│  │                     │     │                     │     │                     │ │
+│  │ • mart_top_sql_tab  │     │                     │     │                     │ │
+│  │   - 历史 SQL        │     │                     │     │                     │ │
+│  └──────────┬──────────┘     └──────────┬──────────┘     └──────────┬──────────┘ │
+│             │                           │                           │            │
+└─────────────┼───────────────────────────┼───────────────────────────┼────────────┘
+              │                           │                           │
+              ▼                           ▼                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              数据获取层                                           │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  get_table_details_by_      get_table_sample_data()   search_similar_tables()    │
+│  full_table_names()                                                              │
+│           │                           │                           │              │
+│           │  get_related_doc_by_kb()  │                           │              │
+│           │           │               │                           │              │
+│           │  get_table_top_sql_       │                           │              │
+│           │  by_name_list()           │                           │              │
+│           │           │               │                           │              │
+└───────────┼───────────┼───────────────┼───────────────────────────┼──────────────┘
+            │           │               │                           │
+            ▼           ▼               ▼                           ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           find_data Tool 返回                                     │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  {                                                                                │
+│    "related_tables": [TableDetail, ...],    ← 表结构元数据                        │
+│    "related_docs": [RelatedDoc, ...],       ← 业务文档                            │
+│    "related_glossaries": [...],             ← 术语定义                            │
+│    "related_rules": [...]                   ← 计算规则                            │
+│  }                                                                                │
+│                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                    preprocess_and_analyze_context() 处理                          │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  state["docs"]              ← related_tables                                      │
+│  state["find_data_docs"]    ← related_docs (格式化为字符串)                        │
+│  state["find_glossary_info"]← related_glossaries (格式化为字符串)                  │
+│  state["find_rule_info"]    ← related_rules (格式化为字符串)                       │
+│                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                    process_context_and_table_samples() 补充                       │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  state["context"]     ← docs 格式化 + Token 截断 (≤137K tokens)                   │
+│  state["sample_sql"]  ← MySQL mart_top_sql_tab (TOP 3 per table)                 │
+│  state["sample_data"] ← DataMap API + Token 截断 (≤3K tokens)                    │
+│                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              最终 Prompt 组装                                     │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  System Prompt:                                                                   │
+│    "You are a highly skilled {dialect} SQL expert..."                            │
+│                                                                                   │
+│  Context Section:                                                                 │
+│    <context>                                                                      │
+│        {context}              # 表结构元数据                                       │
+│        Sample SQLs: {sample_sql}   # 历史 SQL                                     │
+│        Sample Data: {sample_data}  # 预览数据                                     │
+│    </context>                                                                     │
+│                                                                                   │
+│  Document Context: {find_data_docs}      # 业务文档 (Compass 模式)                │
+│  Glossary Context: {find_glossary_info}  # 术语定义 (Compass 模式)                │
+│  Rule Context: {find_rule_info}          # 计算规则 (Compass 模式)                │
+│                                                                                   │
+│  User Background: {user_background_info}  # 用户信息                              │
+│                                                                                   │
+│  User Question: {question}                # 用户问题                              │
+│                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                                   调用 LLM
+                              (codecompass-sql / gemini)
+```
+
+---
+
+## Sample Data 在 LLM 中的作用详解
+
+### 核心作用概述
+
+Sample Data（样例数据）是帮助 LLM **从"知道列名"升级到"理解列的实际数据"** 的关键上下文信息。
+
+### 1. 帮助确定分区列的值格式（最重要）
+
+这是 Sample Data 的**最重要作用**。Prompt 中明确说明：
+
+```python
+# di_brain/text2sql/text2sql_prompt.py
+
+"""
+4. If a selected table contains partition columns (columns marked as `partition: true`), 
+   you MUST include all partition columns in the WHERE clause of the query. 
+   
+   If you are not sure about the value of the partition columns, you can use 
+   'preview_data' in the 'sample_data' section or value from 'enumeration' 
+   in the 'metadata' section to help you decide.
+"""
+```
+
+**实际例子**：
+
+```
+用户问题："查询昨天的 GMV"
+
+❌ 如果没有 sample_data：
+   - LLM 不知道 grass_date 的格式是 "2024-12-14" 还是 "20241214" 还是 "2024/12/14"
+   - 可能生成错误的 SQL：WHERE grass_date = '20241214'  ← 格式错误
+   - 结果：SQL 执行失败或返回空（分区不存在）
+
+✅ 有了 sample_data：
+   - preview_data: ["2024-12-14", "2024-12-13", "2024-12-12"]
+   - LLM 可以确定正确的日期格式是 "yyyy-MM-dd"
+   - 生成正确的 SQL：WHERE grass_date = date_format(current_date - interval '1' day, '%Y-%m-%d')
+```
+
+### 2. 帮助填充 WHERE 条件中的枚举值
+
+```
+用户问题："查询新加坡地区的订单"
+
+❌ 如果没有 sample_data：
+   - LLM 不知道 region 列的值是 "SG" 还是 "Singapore" 还是 "sg"
+   - 可能生成：WHERE region = 'Singapore'  ← 错误的枚举值
+   - 结果：SQL 返回空结果
+
+✅ 有了 sample_data：
+   - preview_data: ["SG", "MY", "TH", "PH", "VN"]
+   - LLM 可以确定正确的枚举值是 "SG"
+   - 生成正确的 SQL：WHERE region = 'SG'
+```
+
+### 3. 减少 [PLACEHOLDER] 占位符的使用
+
+Prompt 中要求 LLM 在不确定值时使用 `[PLACEHOLDER]`：
+
+```python
+"""
+9. If there are values you are not sure about, use the values in the 'sample_data' 
+   section or 'enumeration' in the 'metadata' section to help you decide. 
+   At least they should be marked with '[PLACEHOLDER]' exactly in the final sql.
+"""
+```
+
+**作用**：
+- 有了 sample_data，LLM 可以推断出正确的值
+- 减少需要用户确认的 `[PLACEHOLDER]`
+- 提升用户体验（不需要反复确认）
+
+### 4. 帮助理解列的实际数据类型和格式
+
+```
+Sample Data 示例：
+{
+  "column_name": "order_status",
+  "column_type": "INT",           ← 类型是 INT
+  "preview_data": [1, 2, 3, 4]    ← 但实际含义是状态码
+}
+
+LLM 可以推断：
+- 这是一个状态码字段，不是普通数字
+- 应该使用 WHERE order_status = 1  而不是 WHERE order_status > 0
+```
+
+### 5. 作用总结表
+
+| 作用 | 重要性 | 没有 sample_data 的后果 |
+|------|--------|------------------------|
+| **分区列日期格式** | ⭐⭐⭐⭐⭐ | SQL 执行失败（分区不存在） |
+| **枚举值填充** | ⭐⭐⭐⭐ | SQL 返回空结果 |
+| **减少 PLACEHOLDER** | ⭐⭐⭐ | 需要用户多次确认 |
+| **理解数据含义** | ⭐⭐ | 可能生成逻辑错误的 SQL |
+
+### 6. 实际 SQL 生成对比
+
+```sql
+-- 用户问题："查询昨天新加坡地区已完成订单的 GMV"
+
+-- ❌ 没有 sample_data 时，LLM 可能生成：
+SELECT SUM(gmv) 
+FROM mp_order.dws_order_gmv_1d 
+WHERE grass_date = [PLACEHOLDER]     -- 不知道日期格式
+  AND region = [PLACEHOLDER]         -- 不知道地区编码
+  AND order_status = [PLACEHOLDER]   -- 不知道状态码
+
+-- ✅ 有 sample_data 时，LLM 可以生成：
+SELECT SUM(gmv) 
+FROM mp_order.dws_order_gmv_1d 
+WHERE grass_date = date_format(current_date - interval '1' day, '%Y-%m-%d')
+  AND region = 'SG'
+  AND order_status = 3  -- 假设 preview_data 显示 3 是已完成状态
+```
+
+### 7. 为什么 Compass 模式不使用 Sample Data？
+
+从代码中可以看到：
+
+```python
+# di_brain/text2sql/text2sql_step.py
+
+if state.get("use_compass", False):
+    state["sample_data"] = []  # Compass 模式不使用 sample_data
+```
+
+**可能的原因**：
+1. **Compass (diana) 模型可能通过其他方式获取这些信息**：如 glossary（术语表）、rules（计算规则）中已包含枚举值和格式说明
+2. **模型训练数据**：Compass 模型在训练时可能已经学习了 Shopee 数据仓库的常见数据格式
+3. **性能优化**：减少 Prompt 长度，提升推理速度
+4. **Token 节省**：将 Token 预算留给更重要的上下文信息
+
+---
+
+## Sample Data 存储开销分析
+
+### 存储架构
+
+Sample Data 存储在 **DataMap 服务（元数据中心）** 中，而不是在 DI-Brain 本地：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        DataMap 服务（元数据中心）                            │
+│                                                                              │
+│   API: /datamap/api/v3/system/hive/table/columns/allColumnsPreview          │
+│                                                                              │
+│   内部数据库表存储了所有 Hive 表的预览数据：                                  │
+│   ┌─────────────────────────────────────────────────────────────────┐       │
+│   │  表结构（推测）:                                                  │       │
+│   │  - table_schema       (schema 名)                                │       │
+│   │  - table_name         (表名)                                     │       │
+│   │  - column_name        (列名)                                     │       │
+│   │  - column_type        (列类型)                                   │       │
+│   │  - preview_data       (预览数据 JSON，每列 5-10 条)               │       │
+│   └─────────────────────────────────────────────────────────────────┘       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 存储量估算
+
+假设数据仓库规模：
+- **表数量**：~100,000 张 Hive 表
+- **平均每表列数**：~50 列
+- **每列预览数据**：~10 条记录
+
+| 项目 | 估算值 |
+|------|--------|
+| 每列预览数据大小 | ~500 bytes |
+| 每张表的预览数据 | 50 列 × 500 bytes = **25 KB** |
+| 总数据量 | 100,000 表 × 25 KB = **2.5 GB** |
+| 考虑索引和开销 | **5-10 GB** |
+
+### 存储开销评估
+
+| 场景 | 表数量 | 估算存储量 | 评估 |
+|------|--------|-----------|------|
+| 小型数据仓库 | 10,000 | ~500 MB | ✅ 完全可接受 |
+| 中型数据仓库 | 50,000 | ~2.5 GB | ✅ 可接受 |
+| 大型数据仓库 | 100,000 | ~5-10 GB | ⚠️ 需要监控 |
+| 超大型数据仓库 | 500,000 | ~25-50 GB | ⚠️ 需要优化策略 |
+
+### 可能的优化策略
+
+1. **按需采集（Lazy Loading）**
+   - 只在表被访问时才采集 preview data
+   - 设置过期时间，过期后重新采集
+
+2. **分层存储**
+   - 热门表（访问频繁）：存储完整 preview data
+   - 冷门表（很少访问）：不存储，按需实时查询
+
+3. **压缩存储**
+   - 使用 JSON 压缩或 Protocol Buffers
+   - 预计压缩比 3:1 ~ 5:1
+
+4. **增量更新**
+   - 只更新近期有变更的表
+   - 通过 Hive 元数据变更事件触发
+
+5. **采样策略优化**
+   - 分区列：存 5 条不同值
+   - 普通列：存 3 条典型值
+

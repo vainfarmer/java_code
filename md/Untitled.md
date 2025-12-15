@@ -22,6 +22,7 @@ import com.shopee.di.assistant.convertor.ChatMessageConvertor;
 import com.shopee.di.assistant.dao.entity.ChatMessageTab;
 import com.shopee.di.assistant.dao.entity.ResponseEventTab;
 import com.shopee.di.assistant.dao.entity.ResponseStateTab;
+import com.shopee.di.assistant.service.dto.chat.ReOpenSessionRequestVO;
 import com.shopee.di.assistant.service.dto.chat.SessionStatusDTO;
 import com.shopee.di.assistant.service.response.ResponseEventTabService;
 import com.shopee.di.assistant.rest.client.dto.dibrain.commonchat.CommonChatRequestDTO;
@@ -35,14 +36,14 @@ import com.shopee.di.assistant.service.stream.StreamResponseTracker;
 import com.shopee.di.assistant.service.utils.AssistantGlobalConfig;
 import com.shopee.di.assistant.service.utils.CoreUserLogService;
 import jakarta.annotation.Resource;
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
+
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -50,7 +51,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.SignalType;
 import reactor.core.scheduler.Schedulers;
-
+import org.slf4j.MDC;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
@@ -100,7 +101,7 @@ public class CommonChatStreamService {
 
   @Resource
   private ResponseStateTabService responseStateTabService;
-  
+
   public void commonChatStreamSse(CommonChatRequestVO requestVO, SseEmitter sseEmitter) {
     String user = requestVO.getCommonInfo().getUser();
     String userEmail = requestVO.getCommonInfo().getUserEmail();
@@ -113,6 +114,12 @@ public class CommonChatStreamService {
       coreUserLogService.logIfCoreUser(isCoreUser, requestVO.getSessionId(), LogLevel.INFO, "Use Dashboard stream processing, user: {}, userEmail: {}, sessionId: {}", user, userEmail, requestVO.getSessionId());
       commonChatService.commonChatDashboardStreamSse(requestVO, sseEmitter, session);
       return;
+    }
+
+    Boolean isProcess = responseStateTabService.queryStatus(session.getSessionId());
+    if (Objects.equals(isProcess, Boolean.TRUE)) {
+      log.error("This session is running, can't open a new chat.");
+      throw new ServerException(ResponseCodeEnum.STREAM_ERROR, "Session is running.");
     }
     StreamResponseTracker tracker = new StreamResponseTracker();
     tracker.setIsCoreUser(isCoreUser);
@@ -166,13 +173,15 @@ public class CommonChatStreamService {
           requestVO, session.getModel(), history, threadId, chatId, userSettingDetailVO, isCoreUser);
       coreUserLogService.logIfCoreUser(isCoreUser, requestVO.getSessionId(), LogLevel.INFO, "Create stream request, user: {}, userEmail: {}, request: {}", user, userEmail, JsonUtils.toJsonWithOutNull(commonChatRequestDTO));
 
+      tracker.setIsProd(commonChatRequestDTO.getInput().getChatContext().getIsSuperAccount());
       tracker.setStartTime(System.currentTimeMillis());
       tracker.setDataScope(requestVO.getDataScope());
 
       responseStateTabService.saveStatus(responseChatId, requestVO.getSessionId(), ResponseStatusType.PROCESS);
+      tracker.setStatus(ResponseStatusType.PROCESS.getName());
       coreUserLogService.logIfCoreUser(isCoreUser, requestVO.getSessionId(), LogLevel.INFO, "Set response state to progress, user: {}, userEmail: {}, responseChatId: {}", user, userEmail, responseChatId);
 
-      Disposable streamSubscription = createStreamSubscription(responseChatId, requestVO.getSessionId(), commonChatRequestDTO, tracker, previousTracker, requestVO, chatId);
+      createStreamSubscription(responseChatId, requestVO.getSessionId(), commonChatRequestDTO, tracker, previousTracker, requestVO, chatId);
 
       Disposable pollingDisposable = sendEventsToFrontend(responseChatId, 0L, sseEmitter);
 
@@ -228,7 +237,7 @@ public class CommonChatStreamService {
                                              Long chatId) {
     AtomicLong eventIdCounter = new AtomicLong(0L);
     long startTime = System.currentTimeMillis();
-    
+    commonChatRequestDTO.getInput().setTraceId(MDC.get("requestId"));
     return webClient.post()
         .uri(diBrainUrl + "/router/stream")
         .bodyValue(commonChatRequestDTO)
@@ -242,14 +251,14 @@ public class CommonChatStreamService {
           if (processedEvent == null) {
             return Flux.empty();
           }
-          
+
           // 保存处理后的 event 到 MySQL（包含 tracker 状态，心跳事件不保存）
           if (!isHeartbeatEvent(processedEvent)) {
             saveEventToDatabase(messageId, sessionId, eventIdCounter, processedEvent);
           }
-          
+
           if (Objects.nonNull(response) && Objects.nonNull(response.getStatus())
-              && (Objects.equals(StreamStatusType.END.getType(), response.getStatus()) 
+              && (Objects.equals(StreamStatusType.END.getType(), response.getStatus())
                   || Objects.equals(StreamStatusType.ERROR.getType(), response.getStatus()))) {
             return Flux.just(processedEvent).concatWith(Flux.empty());
           }
@@ -262,21 +271,19 @@ public class CommonChatStreamService {
                 log.info("Stream subscription detected cancel status, messageId: {}", messageId);
                 tracker.setStreamResponseTracker(previousTracker);
                 tracker.setCanceled(true);
+                tracker.setStatus(ResponseStatusType.CANCEL.getName());
                 // 保存最终结果到数据库
                 saveTrackerResultToDatabase(tracker, requestVO);
                 return Flux.error(new RuntimeException("Stream cancelled by user"));
               }
+              long currentTime = System.currentTimeMillis();
+              long timeoutMs = assistantGlobalConfig.getCommonChatTimeout() * 1000L;
+              if (currentTime - startTime > timeoutMs) {
+                log.error("Stream subscription timeout detected, messageId: {}", messageId);
+                return Flux.error(new ServerException(ResponseCodeEnum.STREAM_TIMEOUT_ERROR));
+              }
               return Flux.empty(); // 继续，不发送任何事件
             }))
-        .map(event -> {
-          // 超时检查
-          long currentTime = System.currentTimeMillis();
-          long timeoutMs = assistantGlobalConfig.getCommonChatTimeout() * 1000L;
-          if (currentTime - startTime > timeoutMs) {
-            throw new ServerException(ResponseCodeEnum.STREAM_TIMEOUT_ERROR);
-          }
-          return event;
-        })
         .takeUntil(event -> {
           // 检查结束条件
           if (Objects.nonNull(event)) {
@@ -302,19 +309,22 @@ public class CommonChatStreamService {
             log.info("CommonChat stream subscription detected cancel status in doFinally, messageId: {}", messageId);
             tracker.setStreamResponseTracker(previousTracker);
             tracker.setCanceled(true);
+            tracker.setStatus(ResponseStatusType.CANCEL.getName());
           }
 
           if (signalType == SignalType.ON_COMPLETE) {
             log.info("CommonChat stream subscription completed normally, messageId: {}", messageId);
             tracker.setCompleted(true);
+            tracker.setStatus(ResponseStatusType.COMPLETE.getName());
           } else if (signalType == SignalType.ON_ERROR) {
             log.info("CommonChat stream subscription terminated due to an error, messageId: {}", messageId);
-            tracker.setError(true);
+            tracker.setStatus(ResponseStatusType.ERROR.getName());
           } else if (signalType == SignalType.CANCEL) {
             log.info("CommonChat stream subscription was cancelled, messageId: {}", messageId);
             if (!tracker.isCanceled()) {
               tracker.setStreamResponseTracker(previousTracker);
               tracker.setCanceled(true);
+              tracker.setStatus(ResponseStatusType.CANCEL.getName());
             }
           }
           // 保存最终结果到数据库
@@ -327,11 +337,8 @@ public class CommonChatStreamService {
               log.debug("Event processed and saved to database, messageId: {}", messageId);
             },
             error -> {
-              // 错误处理
-              // 检查是否是取消操作
               if (error instanceof RuntimeException && "Stream cancelled by user".equals(error.getMessage())) {
                 log.info("CommonChat stream subscription cancelled by user, messageId: {}", messageId);
-                // 取消流程已在 mergeWith 中处理，这里不需要额外处理
                 return;
               }
 
@@ -365,7 +372,9 @@ public class CommonChatStreamService {
    * @return Disposable 用于管理轮询任务
    */
   public Disposable sendEventsToFrontend(Long messageId, Long startEventId, SseEmitter sseEmitter) {
-
+    if (Objects.isNull(startEventId)) {
+      startEventId = 0L;
+    }
     AtomicLong lastEventId = new AtomicLong(startEventId);
     AtomicBoolean isEnd = new AtomicBoolean(false);
 
@@ -413,8 +422,6 @@ public class CommonChatStreamService {
                 log.warn("Failed to parse event for end check: {}", event.getContent(), e);
               }
             }
-
-            // 发送事件给前端
             try {
               sseEmitter.send(event.getContent());
             } catch (IOException e) {
@@ -424,10 +431,8 @@ public class CommonChatStreamService {
               return Flux.just(true); // 标记结束
             }
           }
-
           return Flux.just(isEnd.get()); // 返回是否结束
         })
-
         .takeUntil(end -> end) // 当检测到结束事件时停止轮询
         .doFinally(signalType -> {
           log.info("Event polling ended with signal: {}, messageId: {}", signalType, messageId);
@@ -511,29 +516,76 @@ public class CommonChatStreamService {
     }
   }
 
+  public void reOpenSessionSse(ReOpenSessionRequestVO request, SseEmitter emitter) {
+    Long responseId = responseStateTabService.getResponseIdBySessionId(request.getSessionId());
+    
+    if (Objects.isNull(responseId)) {
+      log.info("Session {} is already completed, no response found, completing SSE connection", request.getSessionId());
+      try {
+        emitter.complete();
+      } catch (Exception e) {
+        log.error("Failed to complete SSE", e);
+      }
+      return;
+    }
+
+    Disposable pollingDisposable = sendEventsToFrontend(
+        responseId, request.getStartEventId(), emitter);
+
+    emitter.onTimeout(() -> dispose(pollingDisposable));
+    emitter.onCompletion(() -> dispose(pollingDisposable));
+    emitter.onError(throwable -> {
+      dispose(pollingDisposable);
+      emitter.completeWithError(throwable);
+    });
+  }
+
+  /**
+   * 取消前端的订阅
+   * @param disposable
+   */
+  private void dispose(Disposable disposable) {
+    if (disposable != null && !disposable.isDisposed()) {
+      disposable.dispose();
+    }
+  }
+
   /**
    * 根据session id list 批量查询 status
    * @param sessionIds
-   * @return
+   * @return SessionStatusDTO
    */
-  public List<SessionStatusDTO> batchQuerySessionStatus(List<Long> sessionIds){
+  public List<SessionStatusDTO> batchQuerySessionStatus(List<Long> sessionIds) {
+    if (Objects.isNull(sessionIds)) {
+      return new ArrayList<>();
+    }
+
     List<ResponseStateTab> result = responseStateTabService.batchQueryStatus(sessionIds);
 
+    // 对于查询出为null的session Id，也需要返回
+    Map<Long, ResponseStateTab> fillMap = new HashMap<>();
+    for (ResponseStateTab responseStateTab : result) {
+      fillMap.put(responseStateTab.getSessionId(), responseStateTab);
+    }
+
+    // 筛选出哪些session Id在数据库里为空，补上状态为null
+    for (Long sessionId : sessionIds) {
+      if (!fillMap.containsKey(sessionId)) {
+        ResponseStateTab responseStateTab = new ResponseStateTab();
+        responseStateTab.setSessionId(sessionId);
+        responseStateTab.setStatus(ResponseStatusType.IDLE.getType());
+        result.add(responseStateTab);
+      }
+    }
     return result.stream()
         .map(responseStateTab -> SessionStatusDTO.builder()
             .sessionId(responseStateTab.getSessionId())
-            .status(responseStateTab.getStatus())
+            .status(ResponseStatusType.fromType(responseStateTab.getStatus()).name())
             .build())
         .collect(Collectors.toList());
   }
+}
 
-  /**
-   * 用户主动取消chat
-   * @param messageId
-   */
-  public void cancelChat(Long messageId) {
-
-  }
 
   /**
    * 定期（30min）删除event db内的数据
@@ -560,12 +612,15 @@ package com.shopee.di.assistant.controller.common;
 
 import com.shopee.di.assistant.common.model.CommonInfo;
 import com.shopee.di.assistant.common.model.CommonRequest;
+import com.shopee.di.assistant.common.model.ResponseStatusType;
 import com.shopee.di.assistant.common.model.commonchat.CommonChatRequestVO;
 import com.shopee.di.assistant.common.model.commonchat.CommonChatResponseVO;
+import com.shopee.di.assistant.common.model.commonchat.SessionStatusRequestVO;
+import com.shopee.di.assistant.common.resp.ResponseDTO;
 import com.shopee.di.assistant.dao.entity.ResponseStateTab;
 import com.shopee.di.assistant.service.common.CommonChatService;
 import com.shopee.di.assistant.service.common.CommonChatStreamService;
-import com.shopee.di.assistant.service.dto.chat.ReOpenSessionRequestDTO;
+import com.shopee.di.assistant.service.dto.chat.ReOpenSessionRequestVO;
 import com.shopee.di.assistant.service.dto.chat.SessionStatusDTO;
 import com.shopee.di.assistant.service.response.ResponseStateTabService;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -586,7 +641,6 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import reactor.core.Disposable;
 
 @Slf4j
 @Tag(name = "Common Chat API")
@@ -627,51 +681,40 @@ public class CommonChatController {
             requestVO.getCommonInfo().setUserEmail(commonRequest.getUserEmail());
         }
 
-        SseEmitter emitter = new SseEmitter(SSE_EMITTER_TIMEOUT);
-        Map<String, String> mdcContext = MDC.getCopyOfContextMap();
-        executor.execute(() -> {
-            if (mdcContext != null) {
-                MDC.setContextMap(mdcContext);
-            }
-            commonChatStreamService.commonChatStreamSse(requestVO, emitter);
-            MDC.clear();
-        });
+    SseEmitter emitter = new SseEmitter(SSE_EMITTER_TIMEOUT);
+    Map<String, String> mdcContext = MDC.getCopyOfContextMap();
+    executor.execute(() -> {
+      if (mdcContext != null) {
+        MDC.setContextMap(mdcContext);
+      }
+      commonChatStreamService.commonChatStreamSse(requestVO, emitter);
+      MDC.clear();
+    });
 
-        return emitter;
-    }
+    return emitter;
+  }
 
   /**
    * 用户reopen session时，需要断点拉取event
+   *
    * @param request
    * @return
    */
-  @PostMapping(value = "/chat/reopen", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-  public SseEmitter reOpenSession(@RequestBody ReOpenSessionRequestDTO request) {
+  @PostMapping(value = "/chat/stream/reopen", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter reOpenSession(@RequestBody ReOpenSessionRequestVO request) {
     log.info("reopen session request:{}", request);
 
     SseEmitter emitter = new SseEmitter(SSE_EMITTER_TIMEOUT);
+    Map<String, String> mdcContext = MDC.getCopyOfContextMap();
 
-    Disposable pollingDisposable =
-        commonChatStreamService.sendEventsToFrontend(request.getMessageId(),
-            request.getStartEventId(),
-            emitter);
-
-    emitter.onTimeout(() -> {
-      // 只停止向前端发送事件，不取消后台订阅，让 createStreamSubscription 继续运行
-      if (!pollingDisposable.isDisposed()) {
-        pollingDisposable.dispose();
-      }
-    });
-    emitter.onCompletion(() -> {
-      // 只停止向前端发送事件，不取消后台订阅，让 createStreamSubscription 继续运行
-      if (!pollingDisposable.isDisposed()) {
-        pollingDisposable.dispose();
-      }
-    });
-    emitter.onError((throwable) -> {
-      // 只停止向前端发送事件，不取消后台订阅，让 createStreamSubscription 继续运行
-      if (!pollingDisposable.isDisposed()) {
-        pollingDisposable.dispose();
+    executor.execute(() -> {
+      try {
+        if (mdcContext != null) {
+          MDC.setContextMap(mdcContext);
+        }
+        commonChatStreamService.reOpenSessionSse(request, emitter);
+      } finally {
+        MDC.clear();
       }
     });
 
@@ -679,40 +722,57 @@ public class CommonChatController {
   }
 
   /**
-   * 查询当前resopnse的完成状态
-   * @param messageId
+   * 查询当前session的完成状态
+   *
+   * @param sessionId
    * @return
    */
   @GetMapping(value = "/query/responseStatus")
-  public Long getResponseStatus(@RequestParam Long messageId) {
-    log.info("query response message Id:{}", messageId);
+  public ResponseDTO<String> getResponseStatus(@RequestParam Long sessionId) {
+    log.info("query response session Id:{}", sessionId);
 
-    ResponseStateTab responseStateTab = responseStateTabService.getByMessageId(messageId);
+    ResponseStateTab responseStateTab = responseStateTabService.getBySessionId(sessionId);
 
-    return responseStateTab.getStatus();
+    // 当messageId查询出来的结果为null时，返回IDLE
+    if (Objects.nonNull(responseStateTab)) {
+      return ResponseDTO.ok(ResponseStatusType.fromType(responseStateTab.getStatus()).name());
+    }
+    return ResponseDTO.ok(ResponseStatusType.IDLE.name());
   }
 
   /**
    * 根据session id list 批量查询 status
-   * @param sessionIds
+   *
    * @return
    */
-  @GetMapping(value = "/batchQuery/responseStatus")
-  public List<SessionStatusDTO> getBatchResponseStatus(@RequestParam("sessionIds") List<Long> sessionIds) {
-    log.info("batch query response sessionIds:{}", sessionIds);
+  @PostMapping(value = "/batchQuery/responseStatus")
+  public List<SessionStatusDTO> getBatchResponseStatus(@RequestBody SessionStatusRequestVO sessionStatusRequestVO) {
+    log.info("batch query response sessionIds:{}", sessionStatusRequestVO.getSessionList());
 
-    return commonChatStreamService.batchQuerySessionStatus(sessionIds);
+    return commonChatStreamService.batchQuerySessionStatus(sessionStatusRequestVO.getSessionList());
   }
 
   /**
    * 用户主动取消chat
-   * @param messageId
+   *
+   * @param sessionId
    */
-  @PostMapping(value = "/cancel/chat")
-  public void cancelChat(@RequestParam Long messageId) {
-    log.info("cancel chat message Id:{}", messageId);
-
-
+  @PostMapping(value = "/chat/stream/cancel")
+  public void cancelChat(@RequestParam Long sessionId) {
+    log.info("cancel session Id:{}", sessionId);
+    ResponseStateTab responseStateTab = responseStateTabService.getBySessionId(sessionId);
+    if (Objects.isNull(responseStateTab)) {
+      log.warn("response state not found, sessionId: {}", sessionId);
+      return;
+    }
+    if (!ResponseStatusType.fromType(responseStateTab.getStatus()).equals(ResponseStatusType.PROCESS)) {
+      log.warn("This session already complete");
+      return;
+    }
+    responseStateTab.setStatus(ResponseStatusType.CANCEL.getType());
+    responseStateTabService.updateById(responseStateTab);
+    log.info("response state updated to cancel, sessionId: {}", sessionId);
   }
 }
+
 ```
