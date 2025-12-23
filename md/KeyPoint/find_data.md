@@ -769,6 +769,508 @@ if embedding_result_quality < 0.5:
 
 ---
 
+## 八、find_data 工具的 LLM 调用详解
+
+### 8.1 调用链路
+
+`find_data` 工具本身**不直接调用 LLM**，它通过以下链路最终调用 LLM：
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                       find_data 调用链路                                        │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  Common Agent LLM                                                              │
+│   │                                                                            │
+│   │  (决定调用 find_data 工具)                                                 │
+│   ▼                                                                            │
+│  find_data Tool (tool_router.py)                                              │
+│   │                                                                            │
+│   │  (调用 data_discovery_tool)                                               │
+│   ▼                                                                            │
+│  data_discovery_tool                                                          │
+│   │                                                                            │
+│   │  (HTTP POST → ask_data_global 图)                                         │
+│   ▼                                                                            │
+│  ask_data_global Graph                                                        │
+│   │                                                                            │
+│   │  (并行调用 ask_data Graph)                                                │
+│   ▼                                                                            │
+│  ask_data Graph → invoke_msg_with_llm                                         │
+│   │                                                                            │
+│   │  ★ 这里真正调用 LLM                                                       │
+│   ▼                                                                            │
+│  GET_STRUCTURED_LLM("gpt-4.1-mini")                                           │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 8.2 find_data 工具的输入参数
+
+```python
+# di_brain/router/tool_router.py (第 406-430 行)
+@tool
+def find_data(
+    user_question: str,                        # 用户的问题文本
+    config: RunnableConfig,                    # 运行配置
+    state: Annotated[dict, InjectedState],     # 当前状态（自动注入）
+    
+    selected_tables: Annotated[
+        List[DataTable],
+        "the data tables that the user directly mentioned in question. "
+        "If the user did not mention the data tables, this parameter should be empty list.",
+    ],
+    # ↑ 用户直接提到的数据表列表
+    # 格式: [{"id": "SG.mp_order.order_fact", "name": "order_fact", ...}]
+    
+    selected_table_groups: Annotated[
+        List[TableGroupModel],
+        "the data table groups that the user directly mentioned in question. "
+        "If the user did not mention the data table groups, this parameter should be empty list.",
+    ],
+    # ↑ 用户直接提到的表组列表
+    # 格式: [{"id": "DataMart.Order Mart", "name": "Order Mart", ...}]
+    
+    final_intent: Annotated[
+        Literal[
+            "data_discovery",             # 只想发现数据
+            "generate_sql",               # 想生成 SQL
+            "fix_sql",                    # 想修复 SQL
+            "execute_sql_and_analyze_result",  # 想执行并分析结果
+            "search_log",                 # 想搜索日志
+        ],
+        "The final, high-level intent or goal of the user's question. "
+        "If the user's problem involves data search or analysis, "
+        "the ultimate goal must be to Execute SQL and Analyze Results.",
+    ] = None,
+    # ↑ 用户的最终意图（由 Common Agent 判断）
+):
+    """The 'Find Data' tool has following capabilities：
+    * Can analyze the user's question and then help the user find the 
+      correct HiveTables or ChatDatasets that contains the data the user wants.
+    * Can give table descriptions and column details based on user-specified 
+      Hivetables or ChatDatasets.
+    """
+```
+
+**参数说明表**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `user_question` | str | ✅ | 用户的原始问题文本 |
+| `config` | RunnableConfig | ✅ | 运行配置，包含 callbacks 等 |
+| `state` | dict | ✅ | 自动注入的当前状态 |
+| `selected_tables` | List[DataTable] | ✅ | 用户明确提到的表列表 |
+| `selected_table_groups` | List[TableGroupModel] | ✅ | 用户明确提到的表组（DataMart/Topic） |
+| `final_intent` | Literal | ❌ | 最终意图，由 Common Agent 判断 |
+
+---
+
+### 8.3 传递给 ask_data_global 图的输入
+
+```python
+# di_brain/router/tool_router.py (第 206-213 行)
+input = AskDataGlobalInput(
+    chat_history=state.get("chat_history", {}),          # 对话历史
+    user_query=user_question,                             # 用户问题
+    chat_context=state.get("chat_context", {}),          # 用户上下文
+    user_hobby={"user_region": user_region},             # 用户偏好（区域）
+    knowledge_base_list=prefixed_data_marts + prefixed_tables,  # KB 列表
+    parent_run_id=parent_run_id,                          # 追踪 ID
+)
+```
+
+**AskDataGlobalInput 字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `chat_history` | dict | 对话历史，包含 `msg_list` 消息列表 |
+| `user_query` | str | 用户的问题文本 |
+| `chat_context` | dict | 用户上下文，包含 `user_email`、`user_region_code` 等 |
+| `user_hobby` | dict | 用户偏好，如 `{"user_region": "SG"}` |
+| `knowledge_base_list` | List[str] | 知识库列表，格式如 `["datamart_Order Mart", "prefill_hive_table_SG.mp_order.order_fact"]` |
+| `parent_run_id` | str | 用于链路追踪的父运行 ID |
+
+---
+
+### 8.4 LLM Prompts（真正给 LLM 的内容）
+
+#### 8.4.1 System Prompt（角色定义）
+
+**文件位置**：`di_brain/ask_data/prompt/prompts.py`
+
+```python
+role_prompt = """
+Today is {now_date}, you are an expert data mart admin. 
+Try to answer the user's question based on the user's background info and the context.
+
+# USER BACKGROUND INFO:
+{user_background_info}
+"""
+```
+
+**变量说明**：
+
+| 变量 | 来源 | 示例 |
+|------|------|------|
+| `now_date` | 系统当前日期 | `2024-12-23` |
+| `user_background_info` | `state["chat_context"]["user_background_info"]` | `"User works in Order Analytics team"` |
+
+#### 8.4.2 Context Prompt（RAG 检索的上下文）
+
+**文件位置**：`di_brain/ask_data/kb_context_composer.py`
+
+```python
+full_context_prompt = """
+# Mart Doc
+Here is the document can help you answer the question.
+
+{mart_doc_str}
+
+
+{glossary_and_rule_str_opt}
+
+
+# Table Manifests
+Here are some hive tables related to the data mart, you can search the table 
+in the document to find the answer.
+
+{manifest_table_list}
+
+Note: For "Table Name" with "_{cid}" placeholder:
+- If "Table Name" doesn't contain "_{cid}" placeholder, keep it unchanged.
+- If "Table Name" contains "_{cid}" placeholder and user doesn't specify a region 
+  in the question, keep "_{cid}" unchanged.
+- If "Table Name" contains "_{cid}" placeholder and user specifies a region 
+  in the question, replace "_{cid}" with the country code 
+  (e.g., _sg for Singapore, _br for Brazil).
+
+{table_details_str_opt}
+"""
+```
+
+**变量说明**：
+
+| 变量 | 来源 | 内容示例 |
+|------|------|---------|
+| `mart_doc_str` | MySQL `knowledge_base_details` 表 | Order Mart 业务文档内容 |
+| `glossary_and_rule_str_opt` | KB Topic Service API | `"Glossary: GMV - Gross Merchandise Value\nRule: GMV计算不含取消订单"` |
+| `manifest_table_list` | MySQL KB 表 (datamap_table_manifest) | 表名、描述、业务域列表 |
+| `table_details_str_opt` | MySQL KB 表 (datamap_table_detail) | 表的详细列信息 JSON |
+
+#### 8.4.3 Output Rules（输出规则）
+
+**文件位置**：`di_brain/ask_data/prompt/prompts.py`
+
+```python
+search_instruct_prompt = """
+# Example Cases
+
+- Case(the question is not related to the context):
+Background Info:
+some documents about datamart description and user guide(no info related about salary info)
+User:
+How to get promoted and raise my salary
+Response:
+data:
+  reason: The question is not related to the context
+
+- Case(you can't find the answer in the context):
+User: 
+How can I use the column website_visible of the table dim_spx_tracking_status_sg?
+Response: 
+data:
+    search_tables: ["SG.spx_mart.dim_spx_tracking_status_sg"]
+
+- Case(you can find the answer in the context, just answer):
+User: 
+How can I use table spx_mart.dwd_spx_fleet_order_tracking_ri_br
+Response:
+data:
+  answer: Contains the latest SPX order transaction log for each order's 
+          process in Brazil...
+  related_tables: ["SG.spx_mart.dwd_spx_fleet_order_tracking_ri_br"]
+
+# OUTPUT RULES:
+1. if you can find the answer in the context, just answer, 
+   the data should be DirectAnswer type
+2. if you can't find the answer in the context, 
+   the data should be SearchMoreInfoThenAnswer type
+3. if the question is not related to the context, 
+   the data should be DontKnow type
+4. related_tables and search_tables should be a list of table names 
+   with the format "IDC_REGION.SCHEMA.TABLE_NAME"
+"""
+```
+
+---
+
+### 8.5 完整的 LLM 输入结构
+
+LLM 接收的是一个**消息列表 (msg_list)**，结构如下：
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                      LLM 输入消息列表 (msg_list)                               │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  [0] SystemMessage:                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │ Today is 2024-12-23, you are an expert data mart admin...              │  │
+│  │                                                                         │  │
+│  │ # USER BACKGROUND INFO:                                                 │  │
+│  │ User is from Singapore, works in Order Analytics team...              │  │
+│  │                                                                         │  │
+│  │ # Mart Doc                                                              │  │
+│  │ Here is the document can help you answer the question.                │  │
+│  │ [Order Mart 业务文档内容...]                                           │  │
+│  │                                                                         │  │
+│  │ # Glossary                                                              │  │
+│  │ - GMV: Gross Merchandise Value, 交易总额                               │  │
+│  │ - DAU: Daily Active Users, 日活跃用户                                  │  │
+│  │                                                                         │  │
+│  │ # Table Manifests                                                       │  │
+│  │ | Table Name | Description | Business Domain |                        │  │
+│  │ | SG.dwd.order_fact | 订单事实表 | Order |                            │  │
+│  │ | SG.dim.region_dim | 区域维度表 | Dimension |                        │  │
+│  │                                                                         │  │
+│  │ # Example Cases                                                         │  │
+│  │ [输出规则和示例...]                                                    │  │
+│  └─────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+│  [1] HumanMessage:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │ 查询最近7天各区域的销售总额                                            │  │
+│  └─────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+**消息组装代码**：
+
+```python
+# di_brain/ask_data/graph.py (第 88-102 行)
+if state.get("chat_history"):
+    # 续话模式：追加 HumanMessage
+    new_msg_list = state["chat_history"]["msg_list"]
+    new_msg_list.append(HumanMessage(content=retrieve_context + "\n" + user_query))
+else:
+    # 首次对话：构建完整消息列表
+    new_msg_list = [
+        SystemMessage(
+            content=role_prompt.format(
+                now_date=datetime.now().strftime("%Y-%m-%d"),
+                user_background_info=state.get("chat_context", {}).get("user_background_info", ""),
+            )
+            + retrieve_context      # RAG 检索的上下文
+            + search_instruct_prompt  # 输出规则
+        ),
+        HumanMessage(content=user_query),
+    ]
+```
+
+---
+
+### 8.6 LLM 输出结构
+
+LLM 使用**结构化输出**，必须返回以下类型之一：
+
+```python
+# di_brain/ask_data/state.py
+
+class DirectAnswer(BaseModel):
+    """LLM 可以直接回答"""
+    answer: str = Field(..., description="The answer to the question")
+    related_tables: list[str] = Field(
+        ..., description="The tables related to the question"
+    )
+
+class SearchMoreInfoThenAnswer(BaseModel):
+    """LLM 需要更多信息才能回答"""
+    search_tables: list[str] = Field(
+        ..., description="The tables to search for more information"
+    )
+
+class DontKnow(BaseModel):
+    """LLM 无法回答（问题超出范围）"""
+    reason: str = Field(..., description="The reason why the answer is not found")
+
+class StructOutput(BaseModel):
+    """最终输出包装类"""
+    data: Union[DirectAnswer, SearchMoreInfoThenAnswer, DontKnow]
+```
+
+**输出示例**：
+
+```python
+# 示例 1: DirectAnswer（直接回答）
+{
+    "data": {
+        "answer": "GMV 可以通过 order_fact 表的 gmv 列获取...",
+        "related_tables": ["SG.mp_order.dwd_order_fact"]
+    }
+}
+
+# 示例 2: SearchMoreInfoThenAnswer（需要更多信息）
+{
+    "data": {
+        "search_tables": ["SG.mp_order.dwd_order_fact", "SG.mp_order.dim_region"]
+    }
+}
+
+# 示例 3: DontKnow（无法回答）
+{
+    "data": {
+        "reason": "The question is about salary information which is not related to data mart"
+    }
+}
+```
+
+---
+
+### 8.7 多轮对话流程
+
+当 LLM 返回 `SearchMoreInfoThenAnswer` 类型时，会触发**二次检索**：
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                       多轮对话流程                                             │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  Round 1: 初始问答                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐      │
+│  │ User: "如何使用 order_fact 表的 gmv 列？"                          │      │
+│  │                                                                     │      │
+│  │ LLM Response: SearchMoreInfoThenAnswer                              │      │
+│  │   search_tables: ["SG.mp_order.order_fact"]                        │      │
+│  └──────────────────────────────┬─────────────────────────────────────┘      │
+│                                 │                                             │
+│                                 ▼                                             │
+│  Round 2: 补充表详情                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐      │
+│  │ System: (追加 HumanMessage)                                        │      │
+│  │ "Here are the table details related to your query:                 │      │
+│  │  # TABLE DETAILS                                                   │      │
+│  │  order_fact: {                                                     │      │
+│  │    columns: [gmv, order_id, user_id, ...],                        │      │
+│  │    description: '订单事实表...'                                   │      │
+│  │  }"                                                                │      │
+│  │                                                                     │      │
+│  │ LLM Response: DirectAnswer                                          │      │
+│  │   answer: "gmv 列表示订单的交易总额，计算方式为..."                │      │
+│  │   related_tables: ["SG.mp_order.order_fact"]                       │      │
+│  └────────────────────────────────────────────────────────────────────┘      │
+│                                                                                │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```python
+# di_brain/ask_data/graph.py (第 196-260 行)
+def search_related_tables(state, config):
+    """二次检索：根据 LLM 要求的表名获取详情"""
+    
+    # 1. 获取 LLM 要求搜索的表
+    search_tables = state.get("now_llm_answer").data.search_tables
+    
+    # 2. 从 Manifest 中找到相似表
+    manifest = get_merged_manifest(state.get("knowledge_base_list"), state.get("user_query"))
+    similar_table_manifest = manifest.find_similar_tables(search_tables)
+    
+    # 3. 获取表详情
+    table_details = get_table_details_by_full_table_names(
+        similar_table_manifest.get_full_table_names()
+    )
+    
+    # 4. 格式化并追加到消息列表
+    res = "\n\n".join([table.to_str() for table in table_details])
+    msg_list = state.get("chat_history", {}).get("msg_list", [])
+    msg_list.append(
+        HumanMessage(content=searched_table_detail_prompt.format(table_details=res))
+    )
+    
+    # 5. 再次调用 LLM
+    return Command(goto="invoke_msg_with_llm", update={"chat_history": {"msg_list": msg_list}})
+```
+
+---
+
+### 8.8 总结对比表
+
+| 组件 | 内容 | 来源 |
+|------|------|------|
+| **用户问题** | `user_question` | Common Agent 解析 |
+| **选定表列表** | `selected_tables` | Common Agent 从用户输入中解析 |
+| **选定表组** | `selected_table_groups` | Common Agent 从用户输入中解析 |
+| **最终意图** | `final_intent` | Common Agent 判断 |
+| **角色定义** | `role_prompt` | `di_brain/ask_data/prompt/prompts.py` |
+| **RAG 上下文** | `full_context_prompt` | `di_brain/ask_data/kb_context_composer.py` 组装 |
+| **输出规则** | `search_instruct_prompt` | `di_brain/ask_data/prompt/prompts.py` |
+| **LLM 模型** | `gpt-4.1-mini` | 配置 |
+| **输出格式** | `StructOutput` | `di_brain/ask_data/state.py` |
+
+---
+
+### 8.9 ask_data_global 汇总 Prompt
+
+当多个 KB 并行检索完成后，使用以下 Prompt 汇总结果：
+
+**文件位置**：`di_brain/ask_data_global/graph.py` (第 220-270 行)
+
+```python
+prompt = f"""Please analyze and summarize the search results from different markets 
+to answer the user's query.
+
+User Query: {state["user_query"]}
+
+Search Results:
+{
+    chr(10).join([
+        f'''
+Knowledge Base: {result.get("market_name", "Unknown")}
+---
+Result: {result.get("result_context", "")}
+---
+Related Tables:
+{chr(10).join([f"- {table.idc_region}.{table.schema}.{table.table_name} - {table.table_desc}" 
+               for table in result.get("related_tables", [])])}
+'''
+        for result in results
+    ])
+}
+
+You should follow these rules:
+## Format rule:
+    - Generate a structured, user-friendly report in Markdown format.
+    - Organize the content clearly using headings and subheadings.
+    - Use tables to present information where appropriate.
+    - Ensure the report is easy to read and navigate.
+
+## Output example structure:
+    Overview
+    Hive Tables Summary (in a markdown table format)
+    Notes or Recommendations   
+    
+## Table rule:
+    1. You should only use the table from Related Table.
+    2. All mentioned tables should be like *idc_region.schema_name.table_name* style.
+
+DO NOT OUTPUT THE INSTRUCTIONS, JUST OUTPUT THE ANSWER
+DO NOT MAKE THE ANSWER TOO LONG, KEEP IT CONCISE
+DO NOT HAVE H1 TITLE, LIKE REPORT, SUMMARY, etc.
+DO NOT HAVE SAMPLE SQL
+"""
+
+# 调用 LLM 生成摘要
+structured_llm = GET_SPECIFIC_LLM("gpt-4.1-mini", extra_config={"disable_streaming": True})
+summary = structured_llm.invoke(prompt).content
+```
+
+---
+
 ## 九、关键代码文件索引
 
 | 功能 | 文件路径 |

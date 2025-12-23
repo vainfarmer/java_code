@@ -1429,7 +1429,7 @@ if not chat_bi_follow_up:
 
 ---
 
-## 9. 样例数据检索
+## 9. 样例数据（sample data）检索
 
 ### 9.1 概述
 
