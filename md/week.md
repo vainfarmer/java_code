@@ -313,3 +313,30 @@ if __name__ == "__main__":
 
 
 
+```
+cd /usr/local/redis-7.0.15
+redis-server
+redis-cli shutdown
+ps aux | grep redis-server
+sudo kill -9 
+
+brew services start mysql
+brew services stop mysql
+
+
+cd /usr/local/etc
+bin/zookeeper-server-start.sh config/zookeeper.properties 
+bin/kafka-server-start.sh config/server.properties
+# 创建topic
+bin/kafka-topics.sh --create --topic test-events --bootstrap-server localhost:9092
+# 查看状态
+bin/kafka-topics.sh --describe --topic flash-sale-order --bootstrap-server localhost:9092
+# 发送消息
+bin/kafka-console-producer.sh --topic test-events --bootstrap-server localhost:9092
+Hello, Kafka
+This is my first enent
+
+
+qps 1500
+```
+
