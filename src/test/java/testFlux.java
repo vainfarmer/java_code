@@ -34,10 +34,13 @@ public class testFlux {
     CountDownLatch latch = new CountDownLatch(1);
 
     // 1. 创建一个快速的 Flux (生产者每 10 毫秒发送一个数字)
-    Flux<Long> fastProducer = Flux.interval(Duration.ofMillis(10)).take(20);
+    Flux<Long> fastProducer = Flux.interval(Duration.ofMillis(10))
+        .log("fastProducer")
+        .take(20);
 
     // 2. 订阅并使用自定义的慢速消费者 (MySlowSubscriber)
     fastProducer
+        .log("slowSubscriber")
         .doOnRequest(n -> System.out.println("--- Flux 收到需求: " + n + " ---")) // 监听上游请求
         .subscribe(new MySlowSubscriber<>(latch));
 
